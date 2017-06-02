@@ -10,6 +10,7 @@
 #include "storage/bufpage.h"
 #include "storage/procarray.h"
 #include "utils/rel.h"
+#include "utils/snapmgr.h"
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -29,7 +30,7 @@ PG_FUNCTION_INFO_V1(scan_pages);
  */
 static void scan_pages_internal(Oid relid);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
-static bool move_tuples(Relation rel, Page page, BlockNumber blkno, size_t *free_space);
+static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
@@ -98,7 +99,7 @@ scan_pages_internal(Oid relid)
 			}
 			else
 			{
-				if (!move_tuples(rel, page, blkno, &free_space))
+				if (!move_tuples(rel, page, blkno, buf, &free_space))
 				{
 					elog(ERROR, "%s blkno=%u: cannot free any space",
 						 RelationGetRelationName(rel),
@@ -106,7 +107,8 @@ scan_pages_internal(Oid relid)
 				}
 				else
 				{
-					elog(NOTICE, "%s blkno=%u: some tuples were moved",
+					/* TODO: restore NOTICE */
+					elog(ERROR, "%s blkno=%u: some tuples were moved",
 						 RelationGetRelationName(rel),
 						 blkno);
 				}
@@ -167,7 +169,7 @@ can_remove_old_tuples(Page page, size_t *free_space)
 }
 
 static bool
-move_tuples(Relation rel, Page page, BlockNumber blkno, size_t *free_space)
+move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
@@ -179,6 +181,7 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, size_t *free_space)
 		 lp_offset <= lp_count;
 		 lp_offset++, lp++)
 	{
+
 		/* TODO: Probably we should check DEAD and UNUSED too */
 		if (ItemIdIsNormal(lp))
 		{
@@ -191,6 +194,10 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, size_t *free_space)
 			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			tuple.t_len = ItemIdGetLength(lp);
 			ItemPointerSet(&(tuple.t_self), blkno, lp_offset);
+
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 			print_tuple(rel->rd_att, &tuple);
 
