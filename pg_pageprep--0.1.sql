@@ -1,3 +1,16 @@
-CREATE OR REPLACE FUNCTION scan_pages(rel regclass)
-RETURNS VOID AS 'MODULE_PATHNAME', 'scan_pages'
-LANGUAGE C STRICT;
+/* TODO: add @extschema@ */
+
+create table pg_pageprep_data (
+	rel			regclass,	/* relation */
+	fillfactor	integer,	/* original fillfactor value */
+	status		integer		/* processing status: new, in process, done, failed */
+);
+
+create index pg_pageprep_data_idx on pg_pageprep_data (rel);
+
+create or replace function scan_pages(
+	rel			regclass,
+	bgworker	boolean default false
+)
+returns void as 'MODULE_PATHNAME', 'scan_pages'
+language c strict;
