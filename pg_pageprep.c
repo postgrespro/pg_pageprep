@@ -29,9 +29,14 @@ typedef enum TaskStatus
 {
 	TS_NEW = 0,
 	TS_INPROGRESS,
-	TS_DONE,
-	TS_FAILED
+	TS_FAILED,
+	TS_DONE
 } TaskStatus;
+
+/* Get relations to process (we ignore already processed relations) */
+#define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
+			  			"LEFT JOIN pg_pageprep_data p on p.rel = c.oid " 	\
+			  			"WHERE relkind = 'r' AND status IS NULL OR status != 3;"
 
 /*
  * PL funcs
@@ -49,7 +54,7 @@ static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, 
 static bool update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple);
 static void update_indices(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
-static void before_scan(Oid relid);
+static void before_scan(Relation rel);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
@@ -117,6 +122,7 @@ scan_pages_internal(Datum relid_datum)
 	/*
 	 * Scan heap
 	 */
+	elog(NOTICE, "Scanning pages for %s", RelationGetRelationName(rel));
 	for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 	{
 		Buffer		buf;
@@ -170,7 +176,7 @@ scan_pages_internal(Datum relid_datum)
 				else
 				{
 					/* TODO: restore NOTICE */
-					elog(ERROR, "%s blkno=%u: some tuples were moved",
+					elog(NOTICE, "%s blkno=%u: some tuples were moved",
 						 RelationGetRelationName(rel),
 						 blkno);
 				}
@@ -181,6 +187,7 @@ scan_pages_internal(Datum relid_datum)
 		ReleaseBuffer(buf);
 	}
 
+	elog(NOTICE, "Finish page scan for %s", RelationGetRelationName(rel));
 	heap_close(rel, AccessShareLock);
 }
 
@@ -365,6 +372,8 @@ update_indices(Relation rel, HeapTuple tuple)
 		 */
 		ExecInsertIndexTuples(slot, &(tuple->t_self),
 							  estate, false, NULL, NIL);
+
+		ReleaseTupleDesc(tupdesc);
 	}
 }
 
@@ -391,22 +400,81 @@ update_status(Oid relid, TaskStatus status)
 }
 
 static void
-before_scan(Oid relid)
+before_scan(Relation rel)
 {
-	Datum	values[3] = {relid, 100, TS_NEW};
+	Datum	values[3];
 	Oid		types[3] = {OIDOID, INT4OID, INT4OID};
 
-	if (SPI_connect() == SPI_OK_CONNECT)
-	{
+	// if (SPI_connect() == SPI_OK_CONNECT)
+	// {
+		values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
+		/* TODO: is default always equal to HEAP_DEFAULT_FILLFACTOR? */
+		values[1] = Int32GetDatum(RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR));
+		values[2] = Int32GetDatum(TS_NEW);
+
 		/* TODO: get extension's schema */
-		SPI_execute_with_args("INSERT INTO pg_pageprep_data VALUES ($1, $2, $3)",
+		SPI_execute_with_args("INSERT INTO pg_pageprep_data VALUES ($1, $2, $3) "
+							  "ON CONFLICT (rel) DO UPDATE SET status = $3",
 							  3, types, values, NULL,
 							  false, 0);
 
-		SPI_finish();
+		// SPI_finish();
+	// }
+	// else
+	// 	elog(ERROR, "Couldn't establish SPI connections");	
+}
+
+/* */
+static void
+init_pageprep_data(void)
+{
+	List	   *relids = NIL;
+	ListCell   *lc;
+	int			i;
+
+	/* Find relations to process */
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
+			elog(ERROR, "init_pageprep_data() failed");
+
+		if (SPI_processed > 0)
+		{
+			for (i = 0; i < SPI_processed; i++)
+			{
+				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+				HeapTuple	tuple = SPI_tuptable->vals[i];
+				bool		isnull;
+				Oid			relid;
+
+				relid = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+				relids = lappend_oid(relids, relid);
+			}
+		}
 	}
 	else
-		elog(ERROR, "Couldn't establish SPI connections");	
+		elog(ERROR, "Couldn't establish SPI connections");
+
+	/* Add relations to pg_pageprep_data if they aren't there yet */
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		Relation	rel;
+
+		rel = heap_open(relid, AccessShareLock);
+		before_scan(rel);
+		heap_close(rel, AccessShareLock);
+	}
+
+	/* Start processing them one by one */
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+
+		scan_pages_internal(ObjectIdGetDatum(relid));
+
+		/* Put sleep here */
+	}
 }
 
 static void
@@ -425,3 +493,4 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 
 	// pfree(slot);
 }
+

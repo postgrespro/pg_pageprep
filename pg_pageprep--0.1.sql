@@ -6,7 +6,7 @@ create table pg_pageprep_data (
 	status		integer		/* processing status: new, in process, done, failed */
 );
 
-create index pg_pageprep_data_idx on pg_pageprep_data (rel);
+create unique index pg_pageprep_data_idx on pg_pageprep_data (rel);
 
 create or replace function scan_pages(
 	rel			regclass,
