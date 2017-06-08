@@ -14,3 +14,7 @@ create or replace function scan_pages(
 )
 returns void as 'MODULE_PATHNAME', 'scan_pages'
 language c strict;
+
+create or replace function start_bgworker()
+returns void as 'MODULE_PATHNAME', 'start_bgworker'
+language c strict;

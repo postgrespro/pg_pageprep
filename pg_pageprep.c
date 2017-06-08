@@ -3,6 +3,7 @@
 #include "access/heapam.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -14,6 +15,9 @@
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "storage/dsm.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/procarray.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -25,13 +29,19 @@ PG_MODULE_MAGIC;
 #define NEEDED_SPACE_SIZE 16
 
 
-typedef enum TaskStatus
+typedef enum
 {
 	TS_NEW = 0,
 	TS_INPROGRESS,
 	TS_FAILED,
 	TS_DONE
 } TaskStatus;
+
+typedef struct
+{
+	Oid		dbid;
+	Oid		userid;
+} bgworker_args;
 
 /* Get relations to process (we ignore already processed relations) */
 #define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
@@ -42,12 +52,15 @@ typedef enum TaskStatus
  * PL funcs
  */
 PG_FUNCTION_INFO_V1(scan_pages);
+PG_FUNCTION_INFO_V1(start_bgworker);
 
 
 /*
  * Static funcs
  */
-static void scan_pages_bgworker(Datum relid);
+static void start_bgworker_internal(void);
+void worker_main(Datum segment_handle);
+// static void scan_pages_bgworker(Datum relid);
 static void scan_pages_internal(Datum relid_datum);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
 static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
@@ -55,20 +68,40 @@ static bool update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple);
 static void update_indices(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
 static void before_scan(Relation rel);
+static List *init_pageprep_data(MemoryContext mcxt);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
+
+/*
+ * Handle SIGTERM in BGW's process.
+ */
+static void
+handle_sigterm(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+
+	SetLatch(MyLatch);
+
+	if (!proc_exit_inprogress)
+	{
+		InterruptPending = true;
+		ProcDiePending = true;
+	}
+
+	errno = save_errno;
+}
 
 Datum
 scan_pages(PG_FUNCTION_ARGS)
 {
 	Oid		relid = PG_GETARG_OID(0);
-	bool	bgworker = PG_GETARG_BOOL(1);
+	// bool	bgworker = PG_GETARG_BOOL(1);
 
-	if (bgworker)	
-		scan_pages_bgworker(relid);
-	else
-		scan_pages_internal(relid);
+	// if (bgworker)	
+	// 	scan_pages_bgworker(relid);
+	// else
+	scan_pages_internal(relid);
 
 	PG_RETURN_VOID();
 }
@@ -76,28 +109,49 @@ scan_pages(PG_FUNCTION_ARGS)
 /*
  * Start a background worker for page scan
  */
-static void
-scan_pages_bgworker(Datum relid)
+Datum
+start_bgworker(PG_FUNCTION_ARGS)
 {
+	start_bgworker_internal();
 
-	char					bgworker_name[BGW_MAXLEN];
+	PG_RETURN_VOID();
+}
+
+static void
+start_bgworker_internal(void)
+{
 	BackgroundWorker		worker;
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t					pid;
 
-	sprintf(bgworker_name, "pageprep_%u", DatumGetObjectId(relid));
+	/* dsm */
+	bgworker_args		   *args;
+	dsm_segment			   *segment;
+	dsm_handle				segment_handle;
+
+	/* Create a dsm segment for the worker to pass arguments */
+	segment = dsm_create(sizeof(bgworker_args), 0);
+	args = (bgworker_args *) dsm_segment_address(segment);
+	args->dbid = MyDatabaseId;
+	args->userid = GetUserId();
+	segment_handle = dsm_segment_handle(segment);
+
+	// sprintf(bgworker_name, "pageprep_%u", DatumGetObjectId(relid));
 
 	/* Initialize worker struct */
-	memcpy(worker.bgw_name, bgworker_name, BGW_MAXLEN);
-	memcpy(worker.bgw_function_name, CppAsString(scan_pages_internal), BGW_MAXLEN);
+	memcpy(worker.bgw_name, "pageprep_worker", BGW_MAXLEN);
+	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time		= BgWorkerStart_RecoveryFinished;
+	// worker.bgw_start_time		= BgWorkerStart_RecoveryFinished;
+	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
-	worker.bgw_main				= scan_pages_internal;
-	worker.bgw_main_arg			= relid;
+	// worker.bgw_main				= worker_main;
+	worker.bgw_main				= NULL;
+	worker.bgw_main_arg			= Int32GetDatum(segment_handle);
+	// worker.bgw_main_arg			= 0;
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Start dynamic worker */
@@ -107,6 +161,64 @@ scan_pages_bgworker(Datum relid)
 	/* Wait till the worker starts */
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
 		elog(ERROR, "Postmaster died during bgworker startup");
+
+	WaitForBackgroundWorkerShutdown(bgw_handle);
+}
+
+void
+worker_main(Datum segment_handle)
+{
+	dsm_handle		handle = DatumGetUInt32(segment_handle);
+	dsm_segment	   *segment;
+	bgworker_args  *args;
+	List		   *relids;
+	ListCell	   *lc;
+	MemoryContext	mcxt = CurrentMemoryContext;
+
+	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
+	// sleep(20);
+
+	/* Establish signal handlers before unblocking signals. */
+	pqsignal(SIGTERM, handle_sigterm);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Create resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
+
+	segment = dsm_attach(handle);
+	args = (bgworker_args *) dsm_segment_address(segment);
+
+	/* Establish connection and start transaction */
+	BackgroundWorkerInitializeConnectionByOid(args->dbid, args->userid);
+
+	/* Prepare relations for further processing */
+	elog(NOTICE, "init_pageprep_data()");
+	StartTransactionCommand();
+	relids = init_pageprep_data(mcxt);
+	CommitTransactionCommand();
+
+	/* Iterate through relations */
+	foreach(lc, relids)
+	{
+		Oid relid = lfirst_oid(lc);
+
+		/* debug */
+		if (relid != 415605)
+			continue;
+
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		scan_pages_internal(ObjectIdGetDatum(relid));
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+
+		break;
+	}
+	elog(WARNING, "pg_pageprep all done");
 }
 
 
@@ -122,72 +234,84 @@ scan_pages_internal(Datum relid_datum)
 	/*
 	 * Scan heap
 	 */
-	elog(NOTICE, "Scanning pages for %s", RelationGetRelationName(rel));
-	for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
+	elog(NOTICE, "scanning pages for %s", RelationGetRelationName(rel));
+
+	PG_TRY();
 	{
-		Buffer		buf;
-		Page		page;
-		PageHeader	header;
-		size_t		free_space;
-
-		// CHECK_FOR_INTERRUPTS();
-
-		buf = ReadBuffer(rel, blkno);
-
-		/*
-		 * TODO: probably do it only when it is needed
-		 * Prevent everybody from reading and writing into buffer while we are
-		 * moving tuples
-		 */
-		// LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
-
-		/* Skip invalid buffers */
-		if (!BufferIsValid(buf))
-			continue;
-
-		/* TODO: Lock page */
-		page = BufferGetPage(buf);
-		header = (PageHeader) page;
-
-		free_space = header->pd_upper - header->pd_lower;
-
-		/*
-		 * As a first check find a difference between pd_lower and pg_upper.
-		 * If it is at least equal to NEEDED_SPACE_SIZE or greater then we're
-		 * done
-		 */
-		if (free_space < NEEDED_SPACE_SIZE)
+		for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 		{
-			if (can_remove_old_tuples(page, &free_space))
+			Buffer		buf;
+			Page		page;
+			PageHeader	header;
+			size_t		free_space;
+
+			// CHECK_FOR_INTERRUPTS();
+
+			buf = ReadBuffer(rel, blkno);
+
+			/*
+			 * TODO: probably do it only when it is needed
+			 * Prevent everybody from reading and writing into buffer while we are
+			 * moving tuples
+			 */
+			// LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+
+			/* Skip invalid buffers */
+			if (!BufferIsValid(buf))
+				continue;
+
+			/* TODO: Lock page */
+			page = BufferGetPage(buf);
+			header = (PageHeader) page;
+
+			free_space = header->pd_upper - header->pd_lower;
+
+			/*
+			 * As a first check find a difference between pd_lower and pg_upper.
+			 * If it is at least equal to NEEDED_SPACE_SIZE or greater then we're
+			 * done
+			 */
+			if (free_space < NEEDED_SPACE_SIZE)
 			{
-				elog(NOTICE, "%s blkno=%u: can free some space",
-					 RelationGetRelationName(rel),
-					 blkno);
-			}
-			else
-			{
-				if (!move_tuples(rel, page, blkno, buf, &free_space))
+				if (can_remove_old_tuples(page, &free_space))
 				{
-					elog(ERROR, "%s blkno=%u: cannot free any space",
+					elog(NOTICE, "%s blkno=%u: can free some space",
 						 RelationGetRelationName(rel),
 						 blkno);
 				}
 				else
 				{
-					/* TODO: restore NOTICE */
-					elog(NOTICE, "%s blkno=%u: some tuples were moved",
-						 RelationGetRelationName(rel),
-						 blkno);
+					if (!move_tuples(rel, page, blkno, buf, &free_space))
+					{
+						elog(ERROR, "%s blkno=%u: cannot free any space",
+							 RelationGetRelationName(rel),
+							 blkno);
+					}
+					else
+					{
+						/* TODO: restore NOTICE */
+						elog(NOTICE, "%s blkno=%u: some tuples were moved",
+							 RelationGetRelationName(rel),
+							 blkno);
+					}
 				}
 			}
+
+			// LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			ReleaseBuffer(buf);
 		}
-
-		// LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-		ReleaseBuffer(buf);
+		update_status(relid, TS_DONE);
 	}
+	PG_CATCH();
+	{
+		update_status(relid, TS_FAILED);
+	}
+	PG_END_TRY();
 
-	elog(NOTICE, "Finish page scan for %s", RelationGetRelationName(rel));
+	update_status(relid, TS_DONE);
+
+	elog(NOTICE, "finish page scan for %s", RelationGetRelationName(rel));
 	heap_close(rel, AccessShareLock);
 }
 
@@ -280,6 +404,7 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
 				&& (tuphead->t_infomask & ~HEAP_XMAX_COMMITTED))
 			{
 				if (TransactionIdIsInProgress(xmax))
+				// if (TransactionIdDidCommit(xmax))
 					continue;
 			}
 
@@ -414,7 +539,7 @@ before_scan(Relation rel)
 
 		/* TODO: get extension's schema */
 		SPI_execute_with_args("INSERT INTO pg_pageprep_data VALUES ($1, $2, $3) "
-							  "ON CONFLICT (rel) DO UPDATE SET status = $3",
+							  "ON CONFLICT (rel) DO NOTHING",
 							  3, types, values, NULL,
 							  false, 0);
 
@@ -425,16 +550,19 @@ before_scan(Relation rel)
 }
 
 /* */
-static void
-init_pageprep_data(void)
+static List *
+init_pageprep_data(MemoryContext mcxt)
 {
 	List	   *relids = NIL;
 	ListCell   *lc;
 	int			i;
+	MemoryContext spi_mcxt;
 
 	/* Find relations to process */
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
+		spi_mcxt = CurrentMemoryContext;
+
 		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
 			elog(ERROR, "init_pageprep_data() failed");
 
@@ -448,33 +576,40 @@ init_pageprep_data(void)
 				Oid			relid;
 
 				relid = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+
+				MemoryContextSwitchTo(mcxt);
 				relids = lappend_oid(relids, relid);
+				MemoryContextSwitchTo(spi_mcxt);
 			}
 		}
+
+		/* Add relations to pg_pageprep_data if they aren't there yet */
+		foreach(lc, relids)
+		{
+			Oid			relid = lfirst_oid(lc);
+			Relation	rel;
+
+			rel = heap_open(relid, AccessShareLock);
+			before_scan(rel);
+			heap_close(rel, AccessShareLock);
+		}
+
+		SPI_finish();
 	}
 	else
 		elog(ERROR, "Couldn't establish SPI connections");
 
-	/* Add relations to pg_pageprep_data if they aren't there yet */
-	foreach(lc, relids)
-	{
-		Oid			relid = lfirst_oid(lc);
-		Relation	rel;
+	// /* Start processing them one by one */
+	// foreach(lc, relids)
+	// {
+	// 	Oid			relid = lfirst_oid(lc);
 
-		rel = heap_open(relid, AccessShareLock);
-		before_scan(rel);
-		heap_close(rel, AccessShareLock);
-	}
+	// 	scan_pages_internal(ObjectIdGetDatum(relid));
 
-	/* Start processing them one by one */
-	foreach(lc, relids)
-	{
-		Oid			relid = lfirst_oid(lc);
+	// 	/* Put sleep here */
+	// }
 
-		scan_pages_internal(ObjectIdGetDatum(relid));
-
-		/* Put sleep here */
-	}
+	return relids;
 }
 
 static void
