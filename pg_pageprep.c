@@ -136,8 +136,6 @@ start_bgworker_internal(void)
 	args->userid = GetUserId();
 	segment_handle = dsm_segment_handle(segment);
 
-	// sprintf(bgworker_name, "pageprep_%u", DatumGetObjectId(relid));
-
 	/* Initialize worker struct */
 	memcpy(worker.bgw_name, "pageprep_worker", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
@@ -145,13 +143,10 @@ start_bgworker_internal(void)
 
 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
-	// worker.bgw_start_time		= BgWorkerStart_RecoveryFinished;
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
-	// worker.bgw_main				= worker_main;
 	worker.bgw_main				= NULL;
 	worker.bgw_main_arg			= Int32GetDatum(segment_handle);
-	// worker.bgw_main_arg			= 0;
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Start dynamic worker */
@@ -204,7 +199,7 @@ worker_main(Datum segment_handle)
 	{
 		Oid relid = lfirst_oid(lc);
 
-		/* debug */
+		/* TODO: this is a debug code, don't forget to remove it */
 		if (relid != 415605)
 			continue;
 
@@ -291,7 +286,7 @@ scan_pages_internal(Datum relid_datum)
 					else
 					{
 						/* TODO: restore NOTICE */
-						elog(NOTICE, "%s blkno=%u: some tuples were moved",
+						elog(ERROR, "%s blkno=%u: some tuples were moved",
 							 RelationGetRelationName(rel),
 							 blkno);
 					}
@@ -306,6 +301,7 @@ scan_pages_internal(Datum relid_datum)
 	PG_CATCH();
 	{
 		update_status(relid, TS_FAILED);
+		elog(ERROR, "something wrong, finishing scan");
 	}
 	PG_END_TRY();
 
@@ -498,6 +494,7 @@ update_indices(Relation rel, HeapTuple tuple)
 		ExecInsertIndexTuples(slot, &(tuple->t_self),
 							  estate, false, NULL, NIL);
 
+		ExecCloseIndices(result_rel);
 		ReleaseTupleDesc(tupdesc);
 	}
 }
