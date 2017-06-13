@@ -61,7 +61,7 @@ PG_FUNCTION_INFO_V1(start_bgworker);
 static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
 // static void scan_pages_bgworker(Datum relid);
-static void scan_pages_internal(Datum relid_datum);
+static bool scan_pages_internal(Datum relid_datum);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
 static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple);
@@ -197,32 +197,41 @@ worker_main(Datum segment_handle)
 	/* Iterate through relations */
 	foreach(lc, relids)
 	{
-		Oid relid = lfirst_oid(lc);
+		Oid		relid = lfirst_oid(lc);
+		bool	success;
 
 		/* TODO: this is a debug code, don't forget to remove it */
-		if (relid != 415605)
-			continue;
+		// if (relid != 440301)
+		// 	continue;
 
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		scan_pages_internal(ObjectIdGetDatum(relid));
+		success = scan_pages_internal(ObjectIdGetDatum(relid));
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		break;
+		if (!success)
+		{
+			StartTransactionCommand();
+			update_status(relid, TS_FAILED);
+			CommitTransactionCommand();
+		}
+
+		// break;
 	}
 	elog(WARNING, "pg_pageprep all done");
 }
 
 
-static void
+static bool
 scan_pages_internal(Datum relid_datum)
 {
 	Oid			relid = DatumGetObjectId(relid_datum);
 	Relation	rel;
 	BlockNumber	blkno;
+	bool		success = false;
 
 	rel = heap_open(relid, AccessShareLock);
 
@@ -286,7 +295,7 @@ scan_pages_internal(Datum relid_datum)
 					else
 					{
 						/* TODO: restore NOTICE */
-						elog(ERROR, "%s blkno=%u: some tuples were moved",
+						elog(WARNING, "%s blkno=%u: some tuples were moved",
 							 RelationGetRelationName(rel),
 							 blkno);
 					}
@@ -297,18 +306,18 @@ scan_pages_internal(Datum relid_datum)
 			ReleaseBuffer(buf);
 		}
 		update_status(relid, TS_DONE);
+		success = true;
 	}
 	PG_CATCH();
 	{
-		update_status(relid, TS_FAILED);
-		elog(ERROR, "something wrong, finishing scan");
+		success = false;
 	}
 	PG_END_TRY();
 
-	update_status(relid, TS_DONE);
-
 	elog(NOTICE, "finish page scan for %s", RelationGetRelationName(rel));
 	heap_close(rel, AccessShareLock);
+
+	return success;
 }
 
 /*
