@@ -378,19 +378,22 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
 		{
 			HeapTupleHeader	tuphead = (HeapTupleHeader) PageGetItem(page, lp);
 			TransactionId	xmax = HeapTupleHeaderGetRawXmax(tuphead);
-			HeapTupleData	tuple;
+			HeapTupleData	oldtup;
+			HeapTuple		newtup;
 
 			/* Build in-memory tuple representation */
-			tuple.t_tableOid = RelationGetRelid(rel);
-			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-			tuple.t_len = ItemIdGetLength(lp);
-			ItemPointerSet(&(tuple.t_self), blkno, lp_offset);
+			oldtup.t_tableOid = RelationGetRelid(rel);
+			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			oldtup.t_len = ItemIdGetLength(lp);
+			ItemPointerSet(&(oldtup.t_self), blkno, lp_offset);
 
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
+			HeapTupleSatisfiesMVCC(&oldtup, GetActiveSnapshot(), buf);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
-			print_tuple(rel->rd_att, &tuple);
+			newtup = heap_copytuple(&oldtup);
+
+			print_tuple(rel->rd_att, &oldtup);
 
 			/*
 			 * Xmax is valid but isn't commited. We should figure out was the
@@ -412,9 +415,9 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
 			/*
 			 * Is this tuple alive? Good, then we can move it to another page
 			 */
-			if (update_heap_tuple(rel, lp, &tuple))
+			if (update_heap_tuple(rel, lp, newtup))
 			{
-				*free_space += tuple.t_len;
+				*free_space += oldtup.t_len;
 
 				if (*free_space >= NEEDED_SPACE_SIZE)
 					return true;
