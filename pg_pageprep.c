@@ -26,8 +26,15 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define NEEDED_SPACE_SIZE 16
+#define NEEDED_SPACE_SIZE 20
 
+
+/*
+ * TODOs:
+ * 1. lock buffer while we are moving tuples
+ * 2. handle invalidation messages
+ * 3. set fillfactor
+ */
 
 typedef enum
 {
@@ -46,7 +53,12 @@ typedef struct
 /* Get relations to process (we ignore already processed relations) */
 #define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
 			  			"LEFT JOIN pg_pageprep_data p on p.rel = c.oid " 	\
-			  			"WHERE relkind = 'r' AND status IS NULL OR status != 3;"
+			  			"WHERE relkind = 'r' AND c.oid >= 16384 AND "		\
+			  			"(status IS NULL OR status != 3)"
+
+#define Anum_task_relid		1
+#define Anum_task_status	2
+
 
 /*
  * PL funcs
@@ -61,6 +73,7 @@ PG_FUNCTION_INFO_V1(start_bgworker);
 static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
 // static void scan_pages_bgworker(Datum relid);
+static Oid get_next_relation(void);
 static void scan_pages_internal(Datum relid_datum);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
 static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
@@ -96,13 +109,8 @@ Datum
 scan_pages(PG_FUNCTION_ARGS)
 {
 	Oid		relid = PG_GETARG_OID(0);
-	// bool	bgworker = PG_GETARG_BOOL(1);
 
-	// if (bgworker)	
-	// 	scan_pages_bgworker(relid);
-	// else
 	scan_pages_internal(relid);
-
 	PG_RETURN_VOID();
 }
 
@@ -113,7 +121,6 @@ Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
 	start_bgworker_internal();
-
 	PG_RETURN_VOID();
 }
 
@@ -157,7 +164,10 @@ start_bgworker_internal(void)
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
 		elog(ERROR, "Postmaster died during bgworker startup");
 
+	/* TODO: Remove this in the release */
 	WaitForBackgroundWorkerShutdown(bgw_handle);
+
+	dsm_detach(segment);
 }
 
 void
@@ -166,12 +176,10 @@ worker_main(Datum segment_handle)
 	dsm_handle		handle = DatumGetUInt32(segment_handle);
 	dsm_segment	   *segment;
 	bgworker_args  *args;
-	List		   *relids;
-	ListCell	   *lc;
 	MemoryContext	mcxt = CurrentMemoryContext;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
-	// sleep(20);
+	sleep(25);
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -191,31 +199,71 @@ worker_main(Datum segment_handle)
 	/* Prepare relations for further processing */
 	elog(NOTICE, "init_pageprep_data()");
 	StartTransactionCommand();
-	relids = init_pageprep_data(mcxt);
+	init_pageprep_data(mcxt);	/* TODO: free return value */
 	CommitTransactionCommand();
 
 	/* Iterate through relations */
-	foreach(lc, relids)
+	while (true)
 	{
-		Oid relid = lfirst_oid(lc);
-
-		/* TODO: this is a debug code, don't forget to remove it */
-		if (relid != 415605)
-			continue;
+		Oid		relid;
 
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
+
+		relid = get_next_relation();
+		if (!OidIsValid(relid))
+		{
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			break;
+		}
 
 		scan_pages_internal(ObjectIdGetDatum(relid));
 
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		break;
+		/* TODO: sleep here */
+
+		// break;
 	}
 	elog(WARNING, "pg_pageprep all done");
 }
 
+static Oid
+get_next_relation(void)
+{
+	Datum		relid = InvalidOid;
+
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		/* TODO: get extension's schema */
+		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
+			elog(ERROR, "get_next_relation() failed");
+
+		/* At least one relation needs to be processed */
+		if (SPI_processed > 0)
+		{
+			bool		isnull;
+			Datum		datum;
+
+			datum = SPI_getbinval(SPI_tuptable->vals[0],
+								  SPI_tuptable->tupdesc,
+								  Anum_task_relid,
+								  &isnull);
+			if (isnull)
+				elog(ERROR, "get_next_relation(): relid is NULL");
+
+			relid = DatumGetObjectId(datum);
+		}
+
+		SPI_finish();
+	}
+	else
+		elog(ERROR, "Couldn't establish SPI connections");
+
+	return relid;
+}
 
 static void
 scan_pages_internal(Datum relid_datum)
@@ -240,7 +288,7 @@ scan_pages_internal(Datum relid_datum)
 			PageHeader	header;
 			size_t		free_space;
 
-			// CHECK_FOR_INTERRUPTS();
+			CHECK_FOR_INTERRUPTS();
 
 			buf = ReadBuffer(rel, blkno);
 
@@ -286,7 +334,7 @@ scan_pages_internal(Datum relid_datum)
 					else
 					{
 						/* TODO: restore NOTICE */
-						elog(ERROR, "%s blkno=%u: some tuples were moved",
+						elog(WARNING, "%s blkno=%u: some tuples were moved",
 							 RelationGetRelationName(rel),
 							 blkno);
 					}
@@ -301,7 +349,7 @@ scan_pages_internal(Datum relid_datum)
 	PG_CATCH();
 	{
 		update_status(relid, TS_FAILED);
-		elog(ERROR, "something wrong, finishing scan");
+		elog(ERROR, "something is wrong, finishing scan");
 	}
 	PG_END_TRY();
 
@@ -563,21 +611,18 @@ init_pageprep_data(MemoryContext mcxt)
 		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
 			elog(ERROR, "init_pageprep_data() failed");
 
-		if (SPI_processed > 0)
+		for (i = 0; i < SPI_processed; i++)
 		{
-			for (i = 0; i < SPI_processed; i++)
-			{
-				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-				HeapTuple	tuple = SPI_tuptable->vals[i];
-				bool		isnull;
-				Oid			relid;
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			HeapTuple	tuple = SPI_tuptable->vals[i];
+			bool		isnull;
+			Oid			relid;
 
-				relid = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+			relid = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
 
-				MemoryContextSwitchTo(mcxt);
-				relids = lappend_oid(relids, relid);
-				MemoryContextSwitchTo(spi_mcxt);
-			}
+			MemoryContextSwitchTo(mcxt);
+			relids = lappend_oid(relids, relid);
+			MemoryContextSwitchTo(spi_mcxt);
 		}
 
 		/* Add relations to pg_pageprep_data if they aren't there yet */
