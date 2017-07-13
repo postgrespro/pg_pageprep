@@ -35,7 +35,7 @@ PG_MODULE_MAGIC;
  * TODOs:
  * 1. lock buffer while we are moving tuples
  * 2. handle invalidation messages
- * 3. set fillfactor
+ * 3. set fillfactor - done
  */
 
 typedef enum
@@ -48,9 +48,15 @@ typedef enum
 
 typedef struct
 {
+	bool	active;
 	Oid		dbid;
 	Oid		userid;
-} bgworker_args;
+	uint32	per_page_delay;
+	uint32	per_relation_delay;
+} WorkerStatus;
+
+static WorkerStatus *worker_status;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Get relations to process (we ignore already processed relations) */
 #define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
@@ -72,6 +78,8 @@ PG_FUNCTION_INFO_V1(start_bgworker);
 /*
  * Static funcs
  */
+void _PG_init(void);
+static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
 static Oid get_next_relation(void);
@@ -87,6 +95,41 @@ static void update_fillfactor(Oid relid);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
+
+void
+_PG_init(void)
+{
+	prev_shmem_startup_hook = shmem_startup_hook;
+	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
+
+	RequestAddinShmemSpace(sizeof(WorkerStatus));
+}
+
+static void
+pg_pageprep_shmem_startup_hook(void)
+{
+	bool	found;
+	Size	size = sizeof(WorkerStatus);
+
+	/* Invoke original hook if needed */
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+	worker_status = (WorkerStatus *)
+		ShmemInitStruct("pg_pageprep worker status", size, &found);
+
+	/* Initialize 'concurrent_part_slots' if needed */
+	if (!found)
+	{
+		memset(worker_status, 0, size);
+
+		/* default worker delays */
+		worker_status->per_page_delay = 100;
+		worker_status->per_relation_delay = 1000;
+	}
+	LWLockRelease(AddinShmemInitLock);
+}
 
 /*
  * Handle SIGTERM in BGW's process.
@@ -134,16 +177,16 @@ start_bgworker_internal(void)
 	pid_t					pid;
 
 	/* dsm */
-	bgworker_args		   *args;
-	dsm_segment			   *segment;
-	dsm_handle				segment_handle;
+	// bgworker_args		   *args;
+	// dsm_segment			   *segment;
+	// dsm_handle				segment_handle;
 
 	/* Create a dsm segment for the worker to pass arguments */
-	segment = dsm_create(sizeof(bgworker_args), 0);
-	args = (bgworker_args *) dsm_segment_address(segment);
-	args->dbid = MyDatabaseId;
-	args->userid = GetUserId();
-	segment_handle = dsm_segment_handle(segment);
+	// segment = dsm_create(sizeof(bgworker_args), 0);
+	// args = (bgworker_args *) dsm_segment_address(segment);
+	// args->dbid = MyDatabaseId;
+	// args->userid = GetUserId();
+	// segment_handle = dsm_segment_handle(segment);
 
 	/* Initialize worker struct */
 	memcpy(worker.bgw_name, "pageprep_worker", BGW_MAXLEN);
@@ -155,8 +198,13 @@ start_bgworker_internal(void)
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	worker.bgw_main_arg			= Int32GetDatum(segment_handle);
+	// worker.bgw_main_arg			= Int32GetDatum(segment_handle);
+	worker.bgw_main_arg			= 0;
 	worker.bgw_notify_pid		= MyProcPid;
+
+	/* Worker parameters */
+	worker_status->dbid = MyDatabaseId;
+	worker_status->userid = GetUserId();
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
@@ -167,7 +215,7 @@ start_bgworker_internal(void)
 		elog(ERROR, "Postmaster died during bgworker startup");
 
 	/* TODO: Remove this in the release */
-	WaitForBackgroundWorkerShutdown(bgw_handle);
+	// WaitForBackgroundWorkerShutdown(bgw_handle);
 
 	// dsm_detach(segment);
 }
@@ -175,15 +223,12 @@ start_bgworker_internal(void)
 void
 worker_main(Datum segment_handle)
 {
-	dsm_handle		handle = DatumGetUInt32(segment_handle);
-	dsm_segment	   *segment;
-	bgworker_args  *args;
 	MemoryContext	mcxt = CurrentMemoryContext;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
 	sleep(25);
 
-	/* Establish signal handlers before unblocking signals. */
+	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
 
 	/* We're now ready to receive signals */
@@ -192,11 +237,9 @@ worker_main(Datum segment_handle)
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
 
-	segment = dsm_attach(handle);
-	args = (bgworker_args *) dsm_segment_address(segment);
-
 	/* Establish connection and start transaction */
-	BackgroundWorkerInitializeConnectionByOid(args->dbid, args->userid);
+	BackgroundWorkerInitializeConnectionByOid(worker_status->dbid,
+											  worker_status->userid);
 
 	/* Prepare relations for further processing */
 	elog(NOTICE, "init_pageprep_data()");
@@ -245,7 +288,9 @@ worker_main(Datum segment_handle)
 			update_status(relid, TS_FAILED);
 			CommitTransactionCommand();
 		}
+
  		/* TODO: sleep here */
+ 		pg_usleep(worker_status->per_relation_delay);
 	}
 	elog(WARNING, "pg_pageprep all done");
 }
@@ -363,6 +408,8 @@ scan_pages_internal(Datum relid_datum)
 
 			// LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			ReleaseBuffer(buf);
+
+			pg_usleep(worker_status->per_page_delay);
 		}
 		update_status(relid, TS_DONE);
 		success = true;
