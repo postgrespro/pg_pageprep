@@ -84,9 +84,10 @@ static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
 static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum);
+static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
-static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
-static bool update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple);
+// static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
+static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indices(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
 static void before_scan(Relation rel);
@@ -226,6 +227,7 @@ worker_main(Datum segment_handle)
 	MemoryContext	mcxt = CurrentMemoryContext;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
+	// pg_usleep(25000);
 	sleep(25);
 
 	/* Establish signal handlers before unblocking signals */
@@ -353,17 +355,9 @@ scan_pages_internal(Datum relid_datum)
 			PageHeader	header;
 			size_t		free_space;
 
+retry:
 			CHECK_FOR_INTERRUPTS();
-
 			buf = ReadBuffer(rel, blkno);
-
-			/*
-			 * TODO: probably do it only when it is needed
-			 * Prevent everybody from reading and writing into buffer while we are
-			 * moving tuples
-			 */
-			// LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-
 
 			/* Skip invalid buffers */
 			if (!BufferIsValid(buf))
@@ -382,31 +376,62 @@ scan_pages_internal(Datum relid_datum)
 			 */
 			if (free_space < NEEDED_SPACE_SIZE)
 			{
-				if (can_remove_old_tuples(page, &free_space))
+				bool can_free_some_space;
+
+				/*
+				 * Check if there are some dead or redundant tuples which could
+				 * be removed to free enough space for new page format
+				 */
+				LockBuffer(buf, BUFFER_LOCK_SHARE);	/* TODO: move it up */
+				can_free_some_space = can_remove_old_tuples(page, &free_space);
+
+				/* If there are, then we're done with this page */
+				if (can_free_some_space)
 				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					elog(NOTICE, "%s blkno=%u: can free some space",
 						 RelationGetRelationName(rel),
 						 blkno);
 				}
+				/*
+				 * 
+				 */
 				else
 				{
-					if (!move_tuples(rel, page, blkno, buf, &free_space))
-					{
+					HeapTuple		tuple;
+					HeapTuple		new_tuple;
+					OffsetNumber	offnum = FirstOffsetNumber;
+
+					tuple = get_next_tuple(rel, buf, blkno, offnum);
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+					/*
+					 * Could find any tuple. That's wierd. Probably this could
+					 * happen if some transaction holds all the tuples on the
+					 * page
+					 */
+					if (!tuple)
 						elog(ERROR, "%s blkno=%u: cannot free any space",
 							 RelationGetRelationName(rel),
 							 blkno);
-					}
-					else
+
+					new_tuple = heap_copytuple(tuple);
+					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
 					{
-						/* TODO: restore NOTICE */
-						elog(WARNING, "%s blkno=%u: some tuples were moved",
-							 RelationGetRelationName(rel),
-							 blkno);
+						free_space += tuple->t_len;
+
+						/*
+						 * One single tuple should be sufficient since tuple
+						 * header alone takes 23 bytes
+						 */
+						if (free_space >= NEEDED_SPACE_SIZE)
+							return true;
 					}
+
+					goto retry;
 				}
 			}
 
-			// LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			ReleaseBuffer(buf);
 
 			pg_usleep(worker_status->per_page_delay);
@@ -418,7 +443,6 @@ scan_pages_internal(Datum relid_datum)
 	{
 		success = false;
 		update_status(relid, TS_FAILED);
-		// elog(ERROR, "something is wrong, finishing scan");
 	}
 	PG_END_TRY();
 
@@ -429,7 +453,8 @@ scan_pages_internal(Datum relid_datum)
 }
 
 /*
- * Can we remove old tuples in order to free enough space?
+ * can_remove_old_tuples
+ *		Can we remove old tuples in order to free enough space?
  */
 static bool
 can_remove_old_tuples(Page page, size_t *free_space)
@@ -474,43 +499,45 @@ can_remove_old_tuples(Page page, size_t *free_space)
 	return false;
 }
 
-static bool
-move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space)
+/*
+ * get_next_tuple
+ *		Returns tuple that could be moved to another page
+ * 
+ *		Note: Caller must hold shared lock on the page
+ */
+static HeapTuple
+get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
 	ItemId			lp;
+	Page			page;
 
-	/* TODO: Think about page locking!!! */
-
-	/* Iterate over page */
+	page = BufferGetPage(buf);
 	lp_count = PageGetMaxOffsetNumber(page);
-	for (lp_offset = FirstOffsetNumber, lp = PageGetItemId(page, lp_offset);
+
+	for (lp_offset = start_offset, lp = PageGetItemId(page, lp_offset);
 		 lp_offset <= lp_count;
 		 lp_offset++, lp++)
 	{
-
 		/* TODO: Probably we should check DEAD and UNUSED too */
 		if (ItemIdIsNormal(lp))
 		{
 			HeapTupleHeader	tuphead = (HeapTupleHeader) PageGetItem(page, lp);
 			TransactionId	xmax = HeapTupleHeaderGetRawXmax(tuphead);
-			HeapTupleData	oldtup;
-			HeapTuple		newtup;
+			HeapTupleData	tuple;
+			HeapTuple		tuple_copy;
 
 			/* Build in-memory tuple representation */
-			oldtup.t_tableOid = RelationGetRelid(rel);
-			oldtup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
-			oldtup.t_len = ItemIdGetLength(lp);
-			ItemPointerSet(&(oldtup.t_self), blkno, lp_offset);
+			tuple.t_tableOid = RelationGetRelid(rel);
+			tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			tuple.t_len = ItemIdGetLength(lp);
+			ItemPointerSet(&(tuple.t_self), blkno, lp_offset);
 
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			HeapTupleSatisfiesMVCC(&oldtup, GetActiveSnapshot(), buf);
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
 
-			newtup = heap_copytuple(&oldtup);
-
-			print_tuple(rel->rd_att, &oldtup);
+			tuple_copy = heap_copytuple(&tuple);
+			print_tuple(rel->rd_att, &tuple);
 
 			/*
 			 * Xmax is valid but isn't commited. We should figure out was the
@@ -520,7 +547,6 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
 				&& (tuphead->t_infomask & ~HEAP_XMAX_COMMITTED))
 			{
 				if (TransactionIdIsInProgress(xmax))
-				// if (TransactionIdDidCommit(xmax))
 					continue;
 			}
 
@@ -529,20 +555,11 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
 					/* Tuple is invisible, skip it */
 					continue;
 
-			/*
-			 * Is this tuple alive? Good, then we can move it to another page
-			 */
-			if (update_heap_tuple(rel, lp, newtup))
-			{
-				*free_space += oldtup.t_len;
-
-				if (*free_space >= NEEDED_SPACE_SIZE)
-					return true;
-			}
+			return tuple_copy;
 		}
 	}
 
-	return false;
+	return NULL;
 }
 
 /*
@@ -552,20 +569,45 @@ move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free
  * it would be safe to remove old version (and hence free some space).
  */
 static bool
-update_heap_tuple(Relation rel, ItemId lp, HeapTuple tuple)
+update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 {
 	// HeapTupleHeader tuphead;
 
 	/* Update tuple will force creation of new tuple in another page */
-	simple_heap_update(rel, &(tuple->t_self), tuple);
+	// simple_heap_update(rel, &(tuple->t_self), tuple);
 	// heap_update(rel, &(tuple->t_self), tuple, );
 
-	/* Update indexes */
-	// создаем EState
-	// ExecInsertIndexTuples(); // обновляем индексы
-	update_indices(rel, tuple);
+	bool ret;
+	HTSU_Result result;
+	HeapUpdateFailureData hufd;
+	LockTupleMode lockmode;
 
-	return true;
+	result = heap_update(rel, lp, tuple,
+						 GetCurrentCommandId(true), InvalidSnapshot,
+						 true /* wait for commit */ ,
+						 &hufd, &lockmode);
+	switch (result)
+	{
+		/*
+		 * Tuple was already updated in current command or updated concurrently
+		 */
+		case HeapTupleSelfUpdated:
+		case HeapTupleUpdated:
+			ret = false;
+			break;
+
+		/* Done successfully */
+		case HeapTupleMayBeUpdated:
+			ret = true;
+			update_indices(rel, tuple);
+			break;
+
+		default:
+			elog(ERROR, "unrecognized heap_update status: %u", result);
+			break;
+	}
+
+	return ret;
 }
 
 /*
@@ -595,7 +637,6 @@ update_indices(Relation rel, HeapTuple tuple)
 		rte->relid = RelationGetRelid(rel);
 		rte->relkind = rel->rd_rel->relkind;
 		rte->requiredPerms = ACL_INSERT;
-		// range_table = list_make1(rte);
 
 		estate->es_result_relations = result_rel;
 		estate->es_num_result_relations = 1;
@@ -659,11 +700,6 @@ before_scan(Relation rel)
 							  "ON CONFLICT (rel) DO NOTHING",
 							  3, types, values, NULL,
 							  false, 0);
-
-		// SPI_finish();
-	// }
-	// else
-	// 	elog(ERROR, "Couldn't establish SPI connections");	
 }
 
 /* */
