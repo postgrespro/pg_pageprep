@@ -27,7 +27,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define NEEDED_SPACE_SIZE 20
+#define NEEDED_SPACE_SIZE 28
 #define FILLFACTOR 90
 
 
@@ -388,7 +388,6 @@ retry:
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
 				{
-					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					elog(NOTICE, "%s blkno=%u: can free some space",
 						 RelationGetRelationName(rel),
 						 blkno);
@@ -421,14 +420,17 @@ retry:
 						free_space += tuple->t_len;
 
 						/*
-						 * One single tuple should be sufficient since tuple
-						 * header alone takes 23 bytes
+						 * One single tuple could be sufficient since tuple
+						 * header alone takes 23 bytes. But if it's not
+						 * then try again
 						 */
-						if (free_space >= NEEDED_SPACE_SIZE)
-							return true;
+						if (free_space < NEEDED_SPACE_SIZE)
+						{
+							ReleaseBuffer(buf);
+							goto retry;
+						}
 					}
-
-					goto retry;
+					
 				}
 			}
 
