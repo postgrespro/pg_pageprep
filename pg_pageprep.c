@@ -86,7 +86,6 @@ static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
-// static bool move_tuples(Relation rel, Page page, BlockNumber blkno, Buffer buf, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indices(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
@@ -166,6 +165,9 @@ scan_pages(PG_FUNCTION_ARGS)
 Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
+	if (worker_status->active)
+		elog(ERROR, "The worker is already started");
+
 	start_bgworker_internal();
 	PG_RETURN_VOID();
 }
@@ -176,18 +178,6 @@ start_bgworker_internal(void)
 	BackgroundWorker		worker;
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t					pid;
-
-	/* dsm */
-	// bgworker_args		   *args;
-	// dsm_segment			   *segment;
-	// dsm_handle				segment_handle;
-
-	/* Create a dsm segment for the worker to pass arguments */
-	// segment = dsm_create(sizeof(bgworker_args), 0);
-	// args = (bgworker_args *) dsm_segment_address(segment);
-	// args->dbid = MyDatabaseId;
-	// args->userid = GetUserId();
-	// segment_handle = dsm_segment_handle(segment);
 
 	/* Initialize worker struct */
 	memcpy(worker.bgw_name, "pageprep_worker", BGW_MAXLEN);
@@ -227,8 +217,8 @@ worker_main(Datum segment_handle)
 	MemoryContext	mcxt = CurrentMemoryContext;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
-	// pg_usleep(25000);
-	sleep(25);
+	worker_status->active = true;
+	sleep(10);
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -244,10 +234,10 @@ worker_main(Datum segment_handle)
 											  worker_status->userid);
 
 	/* Prepare relations for further processing */
-	elog(NOTICE, "init_pageprep_data()");
-	StartTransactionCommand();
-	init_pageprep_data(mcxt);	/* TODO: free return value */
-	CommitTransactionCommand();
+	// elog(NOTICE, "init_pageprep_data()");
+	// StartTransactionCommand();
+	// init_pageprep_data(mcxt);	/* TODO: free return value */
+	// CommitTransactionCommand();
 
 	/* Iterate through relations */
 	while (true)
@@ -263,9 +253,18 @@ worker_main(Datum segment_handle)
 		{
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			break;
+			sleep(10);
+			continue;
 		}
-		update_fillfactor(relid);
+		// update_fillfactor(relid);
+		else
+		{
+			Relation rel;
+
+			rel = heap_open(relid, AccessShareLock);
+			before_scan(rel);
+			heap_close(rel, AccessShareLock);
+		}
 
 		/* Commit current transaction to apply fillfactor changes */
 		PopActiveSnapshot();
@@ -690,8 +689,8 @@ before_scan(Relation rel)
 	Datum	values[3];
 	Oid		types[3] = {OIDOID, INT4OID, INT4OID};
 
-	// if (SPI_connect() == SPI_OK_CONNECT)
-	// {
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
 		values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
 		/* TODO: is default always equal to HEAP_DEFAULT_FILLFACTOR? */
 		values[1] = Int32GetDatum(RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR));
@@ -702,6 +701,8 @@ before_scan(Relation rel)
 							  "ON CONFLICT (rel) DO NOTHING",
 							  3, types, values, NULL,
 							  false, 0);
+		SPI_finish();
+	}
 }
 
 /* */
