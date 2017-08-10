@@ -42,27 +42,35 @@ typedef enum
 {
 	TS_NEW = 0,
 	TS_INPROGRESS,
+	TS_INTERRUPTED,
 	TS_FAILED,
 	TS_DONE
 } TaskStatus;
 
+typedef enum
+{
+	WS_STOPPED,
+	WS_STOPPING,
+	WS_ACTIVE,
+} WorkerStatus;
+
 typedef struct
 {
-	bool	active;
+	WorkerStatus status;
 	Oid		dbid;
 	Oid		userid;
 	uint32	per_page_delay;
 	uint32	per_relation_delay;
-} WorkerStatus;
+} Worker;
 
-static WorkerStatus *worker_status;
+static Worker *worker_data;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Get relations to process (we ignore already processed relations) */
 #define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
 			  			"LEFT JOIN pg_pageprep_data p on p.rel = c.oid " 	\
 			  			"WHERE relkind = 'r' AND c.oid >= 16384 AND "		\
-			  			"(status IS NULL OR status != 3)"
+			  			"(status IS NULL OR status != 4)"
 
 #define Anum_task_relid		1
 #define Anum_task_status	2
@@ -83,7 +91,7 @@ static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
 static Oid get_next_relation(void);
-static bool scan_pages_internal(Datum relid_datum);
+static bool scan_pages_internal(Datum relid_datum, bool *interrupted);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
@@ -102,31 +110,31 @@ _PG_init(void)
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
 
-	RequestAddinShmemSpace(sizeof(WorkerStatus));
+	RequestAddinShmemSpace(sizeof(Worker));
 }
 
 static void
 pg_pageprep_shmem_startup_hook(void)
 {
 	bool	found;
-	Size	size = sizeof(WorkerStatus);
+	Size	size = sizeof(Worker);
 
 	/* Invoke original hook if needed */
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
 
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
-	worker_status = (WorkerStatus *)
+	worker_data = (Worker *)
 		ShmemInitStruct("pg_pageprep worker status", size, &found);
 
 	/* Initialize 'concurrent_part_slots' if needed */
 	if (!found)
 	{
-		memset(worker_status, 0, size);
+		memset(worker_data, 0, size);
 
 		/* default worker delays */
-		worker_status->per_page_delay = 100;
-		worker_status->per_relation_delay = 1000;
+		worker_data->per_page_delay = 100;
+		worker_data->per_relation_delay = 1000;
 	}
 	LWLockRelease(AddinShmemInitLock);
 }
@@ -154,8 +162,9 @@ Datum
 scan_pages(PG_FUNCTION_ARGS)
 {
 	Oid		relid = PG_GETARG_OID(0);
+	bool	interrupted;
 
-	scan_pages_internal(relid);
+	scan_pages_internal(relid, &interrupted);
 	PG_RETURN_VOID();
 }
 
@@ -165,10 +174,36 @@ scan_pages(PG_FUNCTION_ARGS)
 Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
-	if (worker_status->active)
-		elog(ERROR, "The worker is already started");
+	switch (worker_data->status)
+	{
+		case WS_STOPPING:
+			elog(ERROR, "The worker is being stopped");
+		case WS_ACTIVE:
+			elog(ERROR, "The worker is already started");
+		default:
+			;
+	}
 
 	start_bgworker_internal();
+	PG_RETURN_VOID();
+}
+
+Datum
+stop_bgworker(PG_FUNCTION_ARGS)
+{
+	switch (worker_data->status)
+	{
+		case WS_STOPPED:
+			elog(ERROR, "The worker isn't started");
+		case WS_STOPPING:
+			elog(ERROR, "The worker is being stopped");
+		case WS_ACTIVE:
+			elog(NOTICE, "Stop signal has been sent");
+			worker_data->status = WS_STOPPING;
+			break;
+		default:
+			elog(ERROR, "Unknown status");
+	}
 	PG_RETURN_VOID();
 }
 
@@ -194,8 +229,8 @@ start_bgworker_internal(void)
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Worker parameters */
-	worker_status->dbid = MyDatabaseId;
-	worker_status->userid = GetUserId();
+	worker_data->dbid = MyDatabaseId;
+	worker_data->userid = GetUserId();
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
@@ -217,7 +252,7 @@ worker_main(Datum segment_handle)
 	MemoryContext	mcxt = CurrentMemoryContext;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
-	worker_status->active = true;
+	worker_data->status = WS_ACTIVE;
 	sleep(10);
 
 	/* Establish signal handlers before unblocking signals */
@@ -230,8 +265,8 @@ worker_main(Datum segment_handle)
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
 
 	/* Establish connection and start transaction */
-	BackgroundWorkerInitializeConnectionByOid(worker_status->dbid,
-											  worker_status->userid);
+	BackgroundWorkerInitializeConnectionByOid(worker_data->dbid,
+											  worker_data->userid);
 
 	/* Prepare relations for further processing */
 	// elog(NOTICE, "init_pageprep_data()");
@@ -244,6 +279,13 @@ worker_main(Datum segment_handle)
 	{
 		bool	success;
 		Oid		relid;
+		bool	interrupted;
+
+		CHECK_FOR_INTERRUPTS();
+		if (worker_data->status == WS_STOPPING)
+		{
+			break;
+		}
 
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
@@ -278,12 +320,16 @@ worker_main(Datum segment_handle)
 		StartTransactionCommand();
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		success = scan_pages_internal(ObjectIdGetDatum(relid));
+		success = scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
 
+		/* TODO: Rollback if not successful? */
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 
-		if (!success)
+		if (interrupted)
+			break;
+
+		if (!success & !interrupted)
 		{
 			StartTransactionCommand();
 			update_status(relid, TS_FAILED);
@@ -291,9 +337,14 @@ worker_main(Datum segment_handle)
 		}
 
  		/* TODO: sleep here */
- 		pg_usleep(worker_status->per_relation_delay);
+ 		pg_usleep(worker_data->per_relation_delay);
 	}
-	elog(WARNING, "pg_pageprep all done");
+
+	if (worker_data->status == WS_STOPPING)
+	{
+		elog(NOTICE, "Worker has been stopped");
+		worker_data->status = WS_STOPPED;
+	}
 }
 
 static Oid
@@ -332,13 +383,14 @@ get_next_relation(void)
 }
 
 static bool
-scan_pages_internal(Datum relid_datum)
+scan_pages_internal(Datum relid_datum, bool *interrupted)
 {
 	Oid			relid = DatumGetObjectId(relid_datum);
 	Relation	rel;
 	BlockNumber	blkno;
 	bool		success = false;
 
+	*interrupted = false;
 	PG_TRY();
 	{
 		/*
@@ -356,6 +408,13 @@ scan_pages_internal(Datum relid_datum)
 
 retry:
 			CHECK_FOR_INTERRUPTS();
+
+			if (worker_data->status == WS_STOPPING)
+			{
+				*interrupted = true;
+				break;
+			}
+
 			buf = ReadBuffer(rel, blkno);
 
 			/* Skip invalid buffers */
@@ -429,21 +488,25 @@ retry:
 							goto retry;
 						}
 					}
-					
 				}
 			}
 
 			ReleaseBuffer(buf);
 
-			pg_usleep(worker_status->per_page_delay);
+			pg_usleep(worker_data->per_page_delay);
 		}
-		update_status(relid, TS_DONE);
-		success = true;
+
+		if (*interrupted)
+			update_status(relid, TS_INTERRUPTED);
+		else
+		{
+			update_status(relid, TS_DONE);
+			success = true;
+		}
 	}
 	PG_CATCH();
 	{
 		success = false;
-		update_status(relid, TS_FAILED);
 	}
 	PG_END_TRY();
 
