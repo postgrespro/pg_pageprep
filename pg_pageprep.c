@@ -19,6 +19,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/procarray.h"
+#include "utils/guc.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/lsyscache.h"
@@ -59,8 +60,9 @@ typedef struct
 	WorkerStatus status;
 	Oid		dbid;
 	Oid		userid;
-	uint32	per_page_delay;
-	uint32	per_relation_delay;
+	int		per_page_delay;
+	int		per_relation_delay;
+	int		per_attempt_delay;
 } Worker;
 
 static Worker *worker_data;
@@ -81,12 +83,14 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
  */
 PG_FUNCTION_INFO_V1(scan_pages);
 PG_FUNCTION_INFO_V1(start_bgworker);
+PG_FUNCTION_INFO_V1(stop_bgworker);
 
 
 /*
  * Static funcs
  */
 void _PG_init(void);
+static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_internal(void);
 void worker_main(Datum segment_handle);
@@ -114,6 +118,50 @@ _PG_init(void)
 }
 
 static void
+setup_guc_variables(void)
+{
+	/* Delays */
+	DefineCustomIntVariable("pg_pageprep.per_page_delay",
+							"The delay length between consequent pages scans in milliseconds",
+							NULL,
+							&worker_data->per_page_delay,
+							100,
+							0,
+							1000,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_pageprep.per_relation_delay",
+							"The delay length between relation scans in milliseconds",
+							NULL,
+							&worker_data->per_relation_delay,
+							1000,
+							0,
+							60000,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("pg_pageprep.per_attempt_delay",
+							"The delay length between scans attempts in milliseconds",
+							NULL,
+							&worker_data->per_attempt_delay,
+							60000,
+							0,
+							360000,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+}
+
+static void
 pg_pageprep_shmem_startup_hook(void)
 {
 	bool	found;
@@ -137,6 +185,8 @@ pg_pageprep_shmem_startup_hook(void)
 		worker_data->per_relation_delay = 1000;
 	}
 	LWLockRelease(AddinShmemInitLock);
+
+	setup_guc_variables();
 }
 
 /*
