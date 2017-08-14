@@ -20,9 +20,14 @@
 #include "storage/latch.h"
 #include "storage/procarray.h"
 #include "utils/guc.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
-#include "utils/lsyscache.h"
+#if PG_VERSION_NUM >= 100000
+#include "utils/varlena.h"
+#else
+#include "utils/builtins.h"
+#endif
 
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
@@ -30,7 +35,7 @@ PG_MODULE_MAGIC;
 
 #define NEEDED_SPACE_SIZE 28
 #define FILLFACTOR 90
-
+#define MAX_WORKERS 10
 
 /*
  * TODOs:
@@ -58,14 +63,27 @@ typedef enum
 typedef struct
 {
 	WorkerStatus status;
-	Oid		dbid;
-	Oid		userid;
-	int		per_page_delay;
-	int		per_relation_delay;
-	int		per_attempt_delay;
+	// Oid		dbid;
+	// Oid		userid;
+	// int		per_page_delay;
+	// int		per_relation_delay;
+	// int		per_attempt_delay;
 } Worker;
 
+// typedef struct
+// {
+// 	char *pg_pageprep_databases;
+// } Variables;
+
+
+static int pg_pageprep_per_page_delay = 0;
+static int pg_pageprep_per_relation_delay = 0;
+static int pg_pageprep_per_attempt_delay = 0;
+static char *pg_pageprep_databases = NULL;
+static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
+int MyWorkerIndex = 0;
+// static Variables *variables;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Get relations to process (we ignore already processed relations) */
@@ -93,6 +111,7 @@ void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_internal(void);
+static void start_bgworker_permanent(int idx, const char *dbname);
 void worker_main(Datum segment_handle);
 static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum, bool *interrupted);
@@ -111,10 +130,35 @@ static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 void
 _PG_init(void)
 {
+	char *databases_string;
+	List *databases;
+	ListCell *lc;
+	int i;
+
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
 
-	RequestAddinShmemSpace(sizeof(Worker));
+	RequestAddinShmemSpace(sizeof(Worker) * MAX_WORKERS);
+
+	setup_guc_variables();
+
+    if (!process_shared_preload_libraries_in_progress)
+        return;
+
+	databases_string = pstrdup(pg_pageprep_databases);
+	if (!SplitIdentifierString(databases_string, ',', &databases))
+	{
+		pfree(databases_string);
+		elog(ERROR, "Cannot parse databases list");
+	}
+
+	i = 0;
+	foreach(lc, databases)
+	{
+		char *dbname = lfirst(lc);
+
+		start_bgworker_permanent(i++, dbname);
+	}
 }
 
 static void
@@ -124,7 +168,7 @@ setup_guc_variables(void)
 	DefineCustomIntVariable("pg_pageprep.per_page_delay",
 							"The delay length between consequent pages scans in milliseconds",
 							NULL,
-							&worker_data->per_page_delay,
+							&pg_pageprep_per_page_delay,
 							100,
 							0,
 							1000,
@@ -137,7 +181,7 @@ setup_guc_variables(void)
 	DefineCustomIntVariable("pg_pageprep.per_relation_delay",
 							"The delay length between relation scans in milliseconds",
 							NULL,
-							&worker_data->per_relation_delay,
+							&pg_pageprep_per_relation_delay,
 							1000,
 							0,
 							60000,
@@ -150,7 +194,7 @@ setup_guc_variables(void)
 	DefineCustomIntVariable("pg_pageprep.per_attempt_delay",
 							"The delay length between scans attempts in milliseconds",
 							NULL,
-							&worker_data->per_attempt_delay,
+							&pg_pageprep_per_attempt_delay,
 							60000,
 							0,
 							360000,
@@ -159,13 +203,36 @@ setup_guc_variables(void)
 							NULL,
 							NULL,
 							NULL);
+
+    DefineCustomStringVariable("pg_pageprep.role",
+                            "User name",
+                            NULL,
+                            &pg_pageprep_role,
+                            "postgres",
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+
+    DefineCustomStringVariable("pg_pageprep.databases",
+                            "Comma separated list of databases",
+                            NULL,
+                            &pg_pageprep_databases,
+                            "postgres",
+                            PGC_SIGHUP,
+                            0,
+                            NULL,
+                            NULL,
+                            NULL);
+	
 }
 
 static void
 pg_pageprep_shmem_startup_hook(void)
 {
 	bool	found;
-	Size	size = sizeof(Worker);
+	Size	size = sizeof(Worker) * MAX_WORKERS;
 
 	/* Invoke original hook if needed */
 	if (prev_shmem_startup_hook)
@@ -175,18 +242,23 @@ pg_pageprep_shmem_startup_hook(void)
 	worker_data = (Worker *)
 		ShmemInitStruct("pg_pageprep worker status", size, &found);
 
-	/* Initialize 'concurrent_part_slots' if needed */
 	if (!found)
 	{
-		memset(worker_data, 0, size);
+		int i;
 
-		/* default worker delays */
-		worker_data->per_page_delay = 100;
-		worker_data->per_relation_delay = 1000;
+		for (i = 0; i < MAX_WORKERS; i++)
+		{
+			worker_data[i].status = WS_STOPPED;
+			// memset(worker_data, 0, size);
+
+			// /* default worker delays */
+			// pg_pageprep_per_page_delay = 100;
+			// pg_pageprep_per_relation_delay = 1000;
+		}
 	}
 	LWLockRelease(AddinShmemInitLock);
 
-	setup_guc_variables();
+	// setup_guc_variables();
 }
 
 /*
@@ -224,7 +296,7 @@ scan_pages(PG_FUNCTION_ARGS)
 Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
-	switch (worker_data->status)
+	switch (worker_data[MyWorkerIndex].status)
 	{
 		case WS_STOPPING:
 			elog(ERROR, "The worker is being stopped");
@@ -241,7 +313,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 Datum
 stop_bgworker(PG_FUNCTION_ARGS)
 {
-	switch (worker_data->status)
+	switch (worker_data[MyWorkerIndex].status)
 	{
 		case WS_STOPPED:
 			elog(ERROR, "The worker isn't started");
@@ -249,7 +321,7 @@ stop_bgworker(PG_FUNCTION_ARGS)
 			elog(ERROR, "The worker is being stopped");
 		case WS_ACTIVE:
 			elog(NOTICE, "Stop signal has been sent");
-			worker_data->status = WS_STOPPING;
+			worker_data[MyWorkerIndex].status = WS_STOPPING;
 			break;
 		default:
 			elog(ERROR, "Unknown status");
@@ -279,8 +351,8 @@ start_bgworker_internal(void)
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Worker parameters */
-	worker_data->dbid = MyDatabaseId;
-	worker_data->userid = GetUserId();
+	// worker_data[MyWorkerIndex].dbid = MyDatabaseId;
+	// worker_data[MyWorkerIndex].userid = GetUserId();
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
@@ -296,14 +368,50 @@ start_bgworker_internal(void)
 	// dsm_detach(segment);
 }
 
+static void
+start_bgworker_permanent(int idx, const char *dbname)
+{
+	BackgroundWorker		worker;
+	BackgroundWorkerHandle *bgw_handle;
+	pid_t					pid;
+
+	/* Initialize worker struct */
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
+	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
+	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+
+	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
+									BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time		= BGW_NEVER_RESTART;
+	worker.bgw_main				= NULL;
+	// worker.bgw_main_arg			= Int32GetDatum(segment_handle);
+	worker.bgw_main_arg			= idx;
+	worker.bgw_notify_pid		= 0;
+	// worker.bgw_notify_pid		= MyProcPid;
+
+	/* Worker parameters */
+	// worker_data->dbid = MyDatabaseId;
+	// worker_data->userid = GetUserId();
+
+	/* Start dynamic worker */
+	RegisterBackgroundWorker(&worker);
+		// elog(ERROR, "Cannot start bgworker");
+}
+
 void
-worker_main(Datum segment_handle)
+worker_main(Datum idx_datum)
 {
 	MemoryContext	mcxt = CurrentMemoryContext;
+	char		   *databases_string;
+	List		   *databases;
+	char		   *dbname;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
-	worker_data->status = WS_ACTIVE;
+	worker_data[MyWorkerIndex].status = WS_ACTIVE;
 	sleep(10);
+
+	MyWorkerIndex = DatumGetInt32(idx_datum);
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -314,9 +422,19 @@ worker_main(Datum segment_handle)
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
 
+	databases_string = pstrdup(pg_pageprep_databases);
+	if (!SplitIdentifierString(databases_string, ',', &databases))
+	{
+		pfree(databases_string);
+		elog(ERROR, "Cannot parse databases list");
+	}
+
+	dbname = list_nth(databases, MyWorkerIndex);
+
 	/* Establish connection and start transaction */
-	BackgroundWorkerInitializeConnectionByOid(worker_data->dbid,
-											  worker_data->userid);
+	// BackgroundWorkerInitializeConnectionByOid(worker_data->dbid,
+	// 										  worker_data->userid);
+	BackgroundWorkerInitializeConnection(dbname, pg_pageprep_role);
 
 	/* Prepare relations for further processing */
 	// elog(NOTICE, "init_pageprep_data()");
@@ -332,7 +450,7 @@ worker_main(Datum segment_handle)
 		bool	interrupted;
 
 		CHECK_FOR_INTERRUPTS();
-		if (worker_data->status == WS_STOPPING)
+		if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 		{
 			break;
 		}
@@ -345,7 +463,7 @@ worker_main(Datum segment_handle)
 		{
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			sleep(10);
+			sleep(pg_pageprep_per_attempt_delay);
 			continue;
 		}
 		// update_fillfactor(relid);
@@ -387,14 +505,21 @@ worker_main(Datum segment_handle)
 		}
 
  		/* TODO: sleep here */
- 		pg_usleep(worker_data->per_relation_delay);
+ 		pg_usleep(pg_pageprep_per_relation_delay);
 	}
 
-	if (worker_data->status == WS_STOPPING)
+	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
 		elog(NOTICE, "Worker has been stopped");
-		worker_data->status = WS_STOPPED;
+		worker_data[MyWorkerIndex].status = WS_STOPPED;
 	}
+}
+
+static bool
+check_extension(void)
+{
+	// "SELECT * FROM pg_extension WHERE extname = 'pg_pageprep'";
+	return true;
 }
 
 static Oid
@@ -459,7 +584,7 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 retry:
 			CHECK_FOR_INTERRUPTS();
 
-			if (worker_data->status == WS_STOPPING)
+			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 			{
 				*interrupted = true;
 				break;
@@ -543,7 +668,7 @@ retry:
 
 			ReleaseBuffer(buf);
 
-			pg_usleep(worker_data->per_page_delay);
+			pg_usleep(pg_pageprep_per_page_delay);
 		}
 
 		if (*interrupted)
