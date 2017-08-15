@@ -63,18 +63,9 @@ typedef enum
 typedef struct
 {
 	WorkerStatus status;
-	// Oid		dbid;
-	// Oid		userid;
-	// int		per_page_delay;
-	// int		per_relation_delay;
-	// int		per_attempt_delay;
+	char	dbname[64];
+	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
 } Worker;
-
-// typedef struct
-// {
-// 	char *pg_pageprep_databases;
-// } Variables;
-
 
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
@@ -83,18 +74,18 @@ static char *pg_pageprep_databases = NULL;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
 int MyWorkerIndex = 0;
-// static Variables *variables;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 /* Get relations to process (we ignore already processed relations) */
 #define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
-			  			"LEFT JOIN pg_pageprep_data p on p.rel = c.oid " 	\
+			  			"LEFT JOIN %s.pg_pageprep_data p on p.rel = c.oid " 	\
 			  			"WHERE relkind = 'r' AND c.oid >= 16384 AND "		\
 			  			"(status IS NULL OR status != 4)"
 
 #define Anum_task_relid		1
 #define Anum_task_status	2
 
+#define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
 /*
  * PL funcs
@@ -110,18 +101,18 @@ PG_FUNCTION_INFO_V1(stop_bgworker);
 void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
-static void start_bgworker_internal(void);
+static void start_bgworker_dynamic(void);
 static void start_bgworker_permanent(int idx, const char *dbname);
 void worker_main(Datum segment_handle);
+static Oid get_extension_schema(void);
 static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum, bool *interrupted);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
 static bool can_remove_old_tuples(Page page, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
-static void update_indices(Relation rel, HeapTuple tuple);
+static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
-static void before_scan(Relation rel);
-static List *init_pageprep_data(MemoryContext mcxt);
+static void before_scan(Oid relid);
 static void update_fillfactor(Oid relid);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
@@ -145,6 +136,7 @@ _PG_init(void)
     if (!process_shared_preload_libraries_in_progress)
         return;
 
+    /* Split databases string into list */
 	databases_string = pstrdup(pg_pageprep_databases);
 	if (!SplitIdentifierString(databases_string, ',', &databases))
 	{
@@ -152,6 +144,7 @@ _PG_init(void)
 		elog(ERROR, "Cannot parse databases list");
 	}
 
+	/* Populate workers */
 	i = 0;
 	foreach(lc, databases)
 	{
@@ -223,7 +216,7 @@ setup_guc_variables(void)
                             PGC_SIGHUP,
                             0,
                             NULL,
-                            NULL,
+                            NULL,	/* TODO: disallow to change it in runtime */
                             NULL);
 	
 }
@@ -247,18 +240,9 @@ pg_pageprep_shmem_startup_hook(void)
 		int i;
 
 		for (i = 0; i < MAX_WORKERS; i++)
-		{
 			worker_data[i].status = WS_STOPPED;
-			// memset(worker_data, 0, size);
-
-			// /* default worker delays */
-			// pg_pageprep_per_page_delay = 100;
-			// pg_pageprep_per_relation_delay = 1000;
-		}
 	}
 	LWLockRelease(AddinShmemInitLock);
-
-	// setup_guc_variables();
 }
 
 /*
@@ -306,7 +290,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 			;
 	}
 
-	start_bgworker_internal();
+	start_bgworker_dynamic();
 	PG_RETURN_VOID();
 }
 
@@ -330,7 +314,7 @@ stop_bgworker(PG_FUNCTION_ARGS)
 }
 
 static void
-start_bgworker_internal(void)
+start_bgworker_dynamic(void)
 {
 	BackgroundWorker		worker;
 	BackgroundWorkerHandle *bgw_handle;
@@ -346,13 +330,8 @@ start_bgworker_internal(void)
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	// worker.bgw_main_arg			= Int32GetDatum(segment_handle);
 	worker.bgw_main_arg			= 0;
 	worker.bgw_notify_pid		= MyProcPid;
-
-	/* Worker parameters */
-	// worker_data[MyWorkerIndex].dbid = MyDatabaseId;
-	// worker_data[MyWorkerIndex].userid = GetUserId();
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
@@ -361,19 +340,12 @@ start_bgworker_internal(void)
 	/* Wait till the worker starts */
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
 		elog(ERROR, "Postmaster died during bgworker startup");
-
-	/* TODO: Remove this in the release */
-	// WaitForBackgroundWorkerShutdown(bgw_handle);
-
-	// dsm_detach(segment);
 }
 
 static void
 start_bgworker_permanent(int idx, const char *dbname)
 {
 	BackgroundWorker		worker;
-	BackgroundWorkerHandle *bgw_handle;
-	pid_t					pid;
 
 	/* Initialize worker struct */
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
@@ -385,27 +357,22 @@ start_bgworker_permanent(int idx, const char *dbname)
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	// worker.bgw_main_arg			= Int32GetDatum(segment_handle);
 	worker.bgw_main_arg			= idx;
 	worker.bgw_notify_pid		= 0;
-	// worker.bgw_notify_pid		= MyProcPid;
-
-	/* Worker parameters */
-	// worker_data->dbid = MyDatabaseId;
-	// worker_data->userid = GetUserId();
 
 	/* Start dynamic worker */
 	RegisterBackgroundWorker(&worker);
-		// elog(ERROR, "Cannot start bgworker");
 }
 
+/*
+ * worker_main
+ *		Workers' main routine
+ */
 void
 worker_main(Datum idx_datum)
 {
-	MemoryContext	mcxt = CurrentMemoryContext;
 	char		   *databases_string;
 	List		   *databases;
-	char		   *dbname;
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
@@ -422,25 +389,19 @@ worker_main(Datum idx_datum)
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
 
+	/* Retrieve database name */
 	databases_string = pstrdup(pg_pageprep_databases);
 	if (!SplitIdentifierString(databases_string, ',', &databases))
 	{
-		pfree(databases_string);
 		elog(ERROR, "Cannot parse databases list");
 	}
-
-	dbname = list_nth(databases, MyWorkerIndex);
+	strcpy(worker_data[MyWorkerIndex].dbname,
+		   (char *) list_nth(databases, MyWorkerIndex));
+	pfree(databases_string);
 
 	/* Establish connection and start transaction */
-	// BackgroundWorkerInitializeConnectionByOid(worker_data->dbid,
-	// 										  worker_data->userid);
-	BackgroundWorkerInitializeConnection(dbname, pg_pageprep_role);
-
-	/* Prepare relations for further processing */
-	// elog(NOTICE, "init_pageprep_data()");
-	// StartTransactionCommand();
-	// init_pageprep_data(mcxt);	/* TODO: free return value */
-	// CommitTransactionCommand();
+	BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
+										 pg_pageprep_role);
 
 	/* Iterate through relations */
 	while (true)
@@ -450,8 +411,14 @@ worker_main(Datum idx_datum)
 		bool	interrupted;
 
 		CHECK_FOR_INTERRUPTS();
+
+		/* User sent stop signal */
 		if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 		{
+			/*
+			 * TODO: Set latch or something instead and wait until user decides
+			 * to resume this worker
+			 */
 			break;
 		}
 
@@ -466,14 +433,10 @@ worker_main(Datum idx_datum)
 			sleep(pg_pageprep_per_attempt_delay);
 			continue;
 		}
-		// update_fillfactor(relid);
 		else
 		{
-			Relation rel;
-
-			rel = heap_open(relid, AccessShareLock);
-			before_scan(rel);
-			heap_close(rel, AccessShareLock);
+			update_fillfactor(relid);
+			before_scan(relid);
 		}
 
 		/* Commit current transaction to apply fillfactor changes */
@@ -504,7 +467,6 @@ worker_main(Datum idx_datum)
 			CommitTransactionCommand();
 		}
 
- 		/* TODO: sleep here */
  		pg_usleep(pg_pageprep_per_relation_delay);
 	}
 
@@ -515,11 +477,44 @@ worker_main(Datum idx_datum)
 	}
 }
 
-static bool
-check_extension(void)
+/*
+ * get_extension_schema
+ *		Returns Oid of pg_pageprep extension in current database.
+ *
+ * Note: caller is responsible for establishing SPI connection
+ */
+static Oid
+get_extension_schema(void)
 {
-	// "SELECT * FROM pg_extension WHERE extname = 'pg_pageprep'";
-	return true;
+	Oid res = InvalidOid;
+
+	if (OidIsValid(worker_data[MyWorkerIndex].ext_schema))
+	{
+		return worker_data[MyWorkerIndex].ext_schema;
+	}
+	else
+	{
+		if (SPI_exec(EXTENSION_QUERY, 0) != SPI_OK_SELECT)
+			elog(ERROR, "get_extension_schema(): failed to execute query");
+
+		if (SPI_processed > 0)
+		{
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			HeapTuple	tuple = SPI_tuptable->vals[0];
+			bool		isnull;
+
+			res = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+		}
+
+		if (!OidIsValid(res))
+			ereport(ERROR,
+					(errmsg("Failed to get pg_pageprep extension schema"),
+					 errhint("Perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
+
+		worker_data[MyWorkerIndex].ext_schema = res;
+	}
+
+	return res;
 }
 
 static Oid
@@ -529,8 +524,12 @@ get_next_relation(void)
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		/* TODO: get extension's schema */
-		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
+		char *query;
+
+		query = psprintf(RELATIONS_QUERY,
+						 get_namespace_name(get_extension_schema()));
+
+		if (SPI_exec(query, 0) != SPI_OK_SELECT)
 			elog(ERROR, "get_next_relation() failed");
 
 		/* At least one relation needs to be processed */
@@ -549,6 +548,7 @@ get_next_relation(void)
 			relid = DatumGetObjectId(datum);
 		}
 
+		pfree(query);
 		SPI_finish();
 	}
 	else
@@ -838,7 +838,7 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 		/* Done successfully */
 		case HeapTupleMayBeUpdated:
 			ret = true;
-			update_indices(rel, tuple);
+			update_indexes(rel, tuple);
 			break;
 
 		default:
@@ -850,10 +850,10 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 }
 
 /*
- * Put new tuple location into indices
+ * Put new tuple location into indexes
  */
 static void
-update_indices(Relation rel, HeapTuple tuple)
+update_indexes(Relation rel, HeapTuple tuple)
 {
 	ResultRelInfo	   *result_rel;
 	TupleDesc			tupdesc = rel->rd_att;
@@ -910,11 +910,15 @@ update_status(Oid relid, TaskStatus status)
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		/* TODO: get extension's schema */
-		SPI_execute_with_args("UPDATE pg_pageprep_data SET status = $2 WHERE rel = $1",
+		char *query;
+
+		query = psprintf("UPDATE %s.pg_pageprep_data SET status = $2 WHERE rel = $1",
+						 get_namespace_name(get_extension_schema()));
+		SPI_execute_with_args(query,
 							  2, types, values, NULL,
 							  false, 0);
 
+		pfree(query);
 		SPI_finish();
 	}
 	else
@@ -922,85 +926,33 @@ update_status(Oid relid, TaskStatus status)
 }
 
 static void
-before_scan(Relation rel)
+before_scan(Oid relid)
 {
 	Datum	values[3];
 	Oid		types[3] = {OIDOID, INT4OID, INT4OID};
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
+		Relation rel;
+		char *query;
+
+		rel = heap_open(relid, AccessShareLock);
+		query = psprintf("INSERT INTO %s.pg_pageprep_data VALUES ($1, $2, $3) "
+						 "ON CONFLICT (rel) DO NOTHING",
+						 get_namespace_name(get_extension_schema()));
+
 		values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
 		/* TODO: is default always equal to HEAP_DEFAULT_FILLFACTOR? */
 		values[1] = Int32GetDatum(RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR));
 		values[2] = Int32GetDatum(TS_NEW);
 
-		/* TODO: get extension's schema */
-		SPI_execute_with_args("INSERT INTO pg_pageprep_data VALUES ($1, $2, $3) "
-							  "ON CONFLICT (rel) DO NOTHING",
+		SPI_execute_with_args(query,
 							  3, types, values, NULL,
 							  false, 0);
+		pfree(query);
+		heap_close(rel, AccessShareLock);
 		SPI_finish();
 	}
-}
-
-/* */
-static List *
-init_pageprep_data(MemoryContext mcxt)
-{
-	List	   *relids = NIL;
-	ListCell   *lc;
-	int			i;
-	MemoryContext spi_mcxt;
-
-	/* Find relations to process */
-	if (SPI_connect() == SPI_OK_CONNECT)
-	{
-		spi_mcxt = CurrentMemoryContext;
-
-		if (SPI_exec(RELATIONS_QUERY, 0) != SPI_OK_SELECT)
-			elog(ERROR, "init_pageprep_data() failed");
-
-		for (i = 0; i < SPI_processed; i++)
-		{
-			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-			HeapTuple	tuple = SPI_tuptable->vals[i];
-			bool		isnull;
-			Oid			relid;
-
-			relid = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-
-			MemoryContextSwitchTo(mcxt);
-			relids = lappend_oid(relids, relid);
-			MemoryContextSwitchTo(spi_mcxt);
-		}
-
-		/* Add relations to pg_pageprep_data if they aren't there yet */
-		foreach(lc, relids)
-		{
-			Oid			relid = lfirst_oid(lc);
-			Relation	rel;
-
-			rel = heap_open(relid, AccessShareLock);
-			before_scan(rel);
-			heap_close(rel, AccessShareLock);
-		}
-
-		SPI_finish();
-	}
-	else
-		elog(ERROR, "Couldn't establish SPI connections");
-
-	// /* Start processing them one by one */
-	// foreach(lc, relids)
-	// {
-	// 	Oid			relid = lfirst_oid(lc);
-
-	// 	scan_pages_internal(ObjectIdGetDatum(relid));
-
-	// 	/* Put sleep here */
-	// }
-
-	return relids;
 }
 
 /*
@@ -1016,13 +968,12 @@ update_fillfactor(Oid relid)
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
 		/* TODO: add relation schema */
-		query = psprintf("ALTER TABLE %s SET (fillfactor = %i)",
+		query = psprintf("ALTER TABLE %s.%s SET (fillfactor = %i)",
+						 get_namespace_name(get_extension_schema()),
 						 get_rel_name(relid), FILLFACTOR);
 
-		// SPI_execute_with_args(query, 1, types, values, NULL, false, 0);
 		SPI_exec(query, 0);
 		SPI_finish();
-		// pfree(query);
 	}
 	else
 		elog(ERROR, "Couldn't establish SPI connections");
