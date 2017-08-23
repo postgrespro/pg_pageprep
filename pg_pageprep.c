@@ -87,6 +87,14 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
+#ifdef PGPRO_EE
+#define HeapTupleHeaderGetRawXmax_compat(page, tup) \
+	HeapTupleHeaderGetRawXmax(page, tup)
+#else
+#define HeapTupleHeaderGetRawXmax_compat(page, tup) \
+	HeapTupleHeaderGetRawXmax(tup)
+#endif
+
 /*
  * PL funcs
  */
@@ -376,7 +384,7 @@ worker_main(Datum idx_datum)
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
-	sleep(10);
+	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	MyWorkerIndex = DatumGetInt32(idx_datum);
 
@@ -430,7 +438,7 @@ worker_main(Datum idx_datum)
 		{
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			sleep(pg_pageprep_per_attempt_delay);
+			pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 			continue;
 		}
 		else
@@ -467,7 +475,7 @@ worker_main(Datum idx_datum)
 			CommitTransactionCommand();
 		}
 
- 		pg_usleep(pg_pageprep_per_relation_delay);
+		pg_usleep(pg_pageprep_per_relation_delay * 1000L);
 	}
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
@@ -668,7 +676,7 @@ retry:
 
 			ReleaseBuffer(buf);
 
-			pg_usleep(pg_pageprep_per_page_delay);
+			pg_usleep(pg_pageprep_per_page_delay * 1000L);
 		}
 
 		if (*interrupted)
@@ -717,7 +725,7 @@ can_remove_old_tuples(Page page, size_t *free_space)
 			 * Xmax isn't empty meaning this tuple is an old version and could
 			 * be removed to empty some space
 			 */
-			if (TransactionIdIsValid(HeapTupleHeaderGetRawXmax(tuple)))
+			if (TransactionIdIsValid(HeapTupleHeaderGetRawXmax_compat(page, tuple)))
 			{
 				/*
 				 * Skip deleted tuples which xmax isn't yet commited (or should
@@ -760,10 +768,11 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 		 lp_offset++, lp++)
 	{
 		/* TODO: Probably we should check DEAD and UNUSED too */
+		/* TODO: Use HeapTupleSatisfiesVacuum() to detect dead tuples */
 		if (ItemIdIsNormal(lp))
 		{
 			HeapTupleHeader	tuphead = (HeapTupleHeader) PageGetItem(page, lp);
-			TransactionId	xmax = HeapTupleHeaderGetRawXmax(tuphead);
+			TransactionId	xmax = HeapTupleHeaderGetRawXmax_compat(page, tuphead);
 			HeapTupleData	tuple;
 			HeapTuple		tuple_copy;
 

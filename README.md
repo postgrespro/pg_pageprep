@@ -24,8 +24,8 @@ After that perform `CREATE EXTENSION pg_pageprep;` on each database in cluster.
 
 You can add the following parameters to your postgres config:
 
-`pg_pageprep.databases` - comma separated list of databases (default 'postgres');
-`pg_pageprep.role` - user name (default 'postgres');
-`pg_pageprep.per_page_delay` - delay between consequent page scans in milliseconds (default 100ms);
-`pg_pageprep.per_relation_delay` - delay b/w relations scans in milliseconds (default 1000ms);
-`pg_pageprep.per_attempt_delay` - delay b/w attempts to scan next relation in case previous attempt was unsuccessful, e.g. there are all relations are already done (default 60s).
+* `pg_pageprep.databases` - comma separated list of databases (default 'postgres');
+* `pg_pageprep.role` - user name (default 'postgres');
+* `pg_pageprep.per_page_delay` - delay between consequent page scans in milliseconds (default 100ms);
+* `pg_pageprep.per_relation_delay` - delay b/w relations scans in milliseconds (default 1000ms);
+* `pg_pageprep.per_attempt_delay` - delay b/w attempts to scan next relation in case previous attempt was unsuccessful, e.g. there are all relations are already done (default 60s).
