@@ -53,6 +53,15 @@ typedef enum
 	TS_DONE
 } TaskStatus;
 
+char *status_map[] = 
+{
+	"new",
+	"in progress",
+	"interrupted",
+	"failed",
+	"done"
+};
+
 typedef enum
 {
 	WS_STOPPED,
@@ -76,11 +85,8 @@ static Worker *worker_data;
 int MyWorkerIndex = 0;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
-/* Get relations to process (we ignore already processed relations) */
-#define RELATIONS_QUERY "SELECT c.oid, p.status FROM pg_class c "			\
-			  			"LEFT JOIN %s.pg_pageprep_data p on p.rel = c.oid " 	\
-			  			"WHERE relkind = 'r' AND c.oid >= 16384 AND "		\
-			  			"(status IS NULL OR status != 4)"
+
+#define RELATIONS_QUERY "SELECT * FROM %s.pg_pageprep_todo"
 
 #define Anum_task_relid		1
 #define Anum_task_status	2
@@ -226,7 +232,6 @@ setup_guc_variables(void)
                             NULL,
                             NULL,	/* TODO: disallow to change it in runtime */
                             NULL);
-	
 }
 
 static void
@@ -914,14 +919,14 @@ update_indexes(Relation rel, HeapTuple tuple)
 static void
 update_status(Oid relid, TaskStatus status)
 {
-	Datum	values[2] = {relid, status};
-	Oid		types[2] = {OIDOID, INT4OID};
+	Oid		types[2] = {OIDOID, TEXTOID};
+	Datum	values[2] = {relid, CStringGetTextDatum(status_map[status])};
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
 		char *query;
 
-		query = psprintf("UPDATE %s.pg_pageprep_data SET status = $2 WHERE rel = $1",
+		query = psprintf("SELECT %s.__update_status($1, $2)",
 						 get_namespace_name(get_extension_schema()));
 		SPI_execute_with_args(query,
 							  2, types, values, NULL,
@@ -937,8 +942,8 @@ update_status(Oid relid, TaskStatus status)
 static void
 before_scan(Oid relid)
 {
-	Datum	values[3];
-	Oid		types[3] = {OIDOID, INT4OID, INT4OID};
+	Datum	values[2];
+	Oid		types[2] = {OIDOID, INT4OID};
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
@@ -946,17 +951,15 @@ before_scan(Oid relid)
 		char *query;
 
 		rel = heap_open(relid, AccessShareLock);
-		query = psprintf("INSERT INTO %s.pg_pageprep_data VALUES ($1, $2, $3) "
-						 "ON CONFLICT (rel) DO NOTHING",
+		query = psprintf("SELECT %s.__add_job($1, $2)",
 						 get_namespace_name(get_extension_schema()));
 
 		values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
 		/* TODO: is default always equal to HEAP_DEFAULT_FILLFACTOR? */
 		values[1] = Int32GetDatum(RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR));
-		values[2] = Int32GetDatum(TS_NEW);
 
 		SPI_execute_with_args(query,
-							  3, types, values, NULL,
+							  2, types, values, NULL,
 							  false, 0);
 		pfree(query);
 		heap_close(rel, AccessShareLock);
@@ -970,8 +973,6 @@ before_scan(Oid relid)
 static void
 update_fillfactor(Oid relid)
 {
-	// Datum	values[1] = {FILLFACTOR};
-	// Oid		types[1] = {INT4OID};
 	char *query;
 
 	if (SPI_connect() == SPI_OK_CONNECT)
