@@ -634,6 +634,7 @@ retry:
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
 				{
+					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					elog(NOTICE, "%s blkno=%u: can free some space",
 						 RelationGetRelationName(rel),
 						 blkno);
