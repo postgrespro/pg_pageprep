@@ -3,11 +3,14 @@
 #include "access/heapam.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
+#include "access/reloptions.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "commands/tablecmds.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
+#include "nodes/makefuncs.h"
 #include "miscadmin.h"
 #include "nodes/print.h"
 #include "nodes/execnodes.h"
@@ -978,10 +981,10 @@ update_fillfactor(Oid relid)
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		/* TODO: add relation schema */
-		query = psprintf("ALTER TABLE %s.%s SET (fillfactor = %i)",
+		query = psprintf("select %s.__update_fillfactor(%u, %u)",
 						 get_namespace_name(get_extension_schema()),
-						 get_rel_name(relid), FILLFACTOR);
+						 FILLFACTOR,
+						 relid);
 
 		SPI_exec(query, 0);
 		SPI_finish();
@@ -989,6 +992,39 @@ update_fillfactor(Oid relid)
 	else
 		elog(ERROR, "Couldn't establish SPI connections");
 }
+
+// static void
+// update_fillfactor(Oid relid)
+// {
+// 	Relation		rel;
+// 	RangeVar	   *rangevar;
+// 	AlterTableStmt *stmt = makeNode(AlterTableStmt);
+// 	AlterTableCmd  *cmd = makeNode(AlterTableCmd);
+// 	DefElem		   *elem;
+// 	LOCKMODE		lockmode;
+
+// #if PG_VERSION_NUM < 100000
+// 	elem = makeDefElem("fillfactor", (Node *) makeInteger(FILLFACTOR));
+// #else
+// 	elem = makeDefElem("fillfactor", (Node *) makeInteger(FILLFACTOR), -1);
+// #endif
+
+// 	cmd->subtype = AT_SetRelOptions;
+// 	cmd->def = (Node *) list_make1(elem);
+
+// 	rel = heap_open(relid, AccessShareLock);
+
+// 	rangevar = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+// 							RelationGetRelationName(rel),
+// 							-1);
+
+// 	stmt->relation = rangevar;
+// 	stmt->cmds = list_make1(cmd);
+// 	heap_close(rel, AccessShareLock);
+
+// 	lockmode = AlterTableGetRelOptionsLockLevel((List *) cmd->def);
+// 	AlterTable(relid, lockmode, stmt);
+// }
 
 static void
 print_tuple(TupleDesc tupdesc, HeapTuple tuple)

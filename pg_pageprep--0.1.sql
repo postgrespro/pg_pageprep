@@ -36,7 +36,7 @@ create view pg_pageprep_todo as (
 	from pg_class c
 	left join @extschema@.pg_pageprep_jobs p on p.rel = c.oid
 	where
-		relkind = 'r' and
+		relkind in ('r', 't') and
 		c.oid >= 16384 and
 		(status IS NULL OR status != 'done')
 );
@@ -59,6 +59,41 @@ $$
 	where rel = $1;
 $$
 language sql;
+
+create or replace function __update_fillfactor(relid oid, fillfactor integer)
+returns void
+as
+$$
+declare
+    row      record;
+    relopts  text[];
+    relopt   text;
+    new_relopts text[];
+    found    bool := false;
+    fillfactor_str text := format('fillfactor=%s', fillfactor);
+begin
+    for relopts in select reloptions from pg_class where oid = relid for update
+    loop
+        for relopt in select * from unnest(relopts)
+        loop
+            if position('fillfactor' in relopt) > 0 then
+                --raise notice '%', relopt;
+                new_relopts := new_relopts || fillfactor_str;
+                found := true;
+            else
+                new_relopts := new_relopts || relopt;
+            end if;
+        end loop;
+    end loop;
+
+    if not found then
+        new_relopts := new_relopts || fillfactor_str;
+    end if;
+
+    update pg_class set reloptions = new_relopts where oid = relid;
+end
+$$
+language plpgsql;
 
 create or replace function __restore_fillfactors()
 returns void as
