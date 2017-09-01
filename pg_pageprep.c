@@ -1,5 +1,7 @@
 #include "postgres.h"
 #include "fmgr.h"
+#include "funcapi.h"
+
 #include "access/heapam.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
@@ -7,6 +9,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/tablecmds.h"
+#include "commands/dbcommands.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
@@ -69,6 +72,7 @@ typedef enum
 {
 	WS_STOPPED,
 	WS_STOPPING,
+	WS_STARTING,
 	WS_ACTIVE,
 } WorkerStatus;
 
@@ -110,6 +114,7 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 PG_FUNCTION_INFO_V1(scan_pages);
 PG_FUNCTION_INFO_V1(start_bgworker);
 PG_FUNCTION_INFO_V1(stop_bgworker);
+PG_FUNCTION_INFO_V1(get_workers_list);
 
 
 /*
@@ -119,7 +124,8 @@ void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_dynamic(void);
-static void start_bgworker_permanent(int idx, const char *dbname);
+static void start_bgworker_permanent(const char *dbname);
+static int acquire_slot(const char *dbname);
 void worker_main(Datum segment_handle);
 static Oid get_extension_schema(void);
 static Oid get_next_relation(void);
@@ -141,7 +147,6 @@ _PG_init(void)
 	char *databases_string;
 	List *databases;
 	ListCell *lc;
-	int i;
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
@@ -162,12 +167,11 @@ _PG_init(void)
 	}
 
 	/* Populate workers */
-	i = 0;
 	foreach(lc, databases)
 	{
 		char *dbname = lfirst(lc);
 
-		start_bgworker_permanent(i++, dbname);
+		start_bgworker_permanent(dbname);
 	}
 }
 
@@ -300,6 +304,8 @@ start_bgworker(PG_FUNCTION_ARGS)
 	{
 		case WS_STOPPING:
 			elog(ERROR, "The worker is being stopped");
+		case WS_STARTING:
+			elog(ERROR, "The worker is being started");
 		case WS_ACTIVE:
 			elog(ERROR, "The worker is already started");
 		default:
@@ -329,15 +335,110 @@ stop_bgworker(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
+typedef struct
+{
+	int cur_idx; /* current slot to be processed */
+} workers_cxt;
+
+Datum
+get_workers_list(PG_FUNCTION_ARGS)
+{
+	FuncCallContext	   *funcctx;
+	workers_cxt *userctx;
+	int		i;
+
+	/*
+	 * Initialize tuple descriptor & function call context.
+	 */
+	if (SRF_IS_FIRSTCALL())
+	{
+		TupleDesc			tupdesc;
+		MemoryContext		old_mcxt;
+
+		funcctx = SRF_FIRSTCALL_INIT();
+
+		old_mcxt = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
+
+		userctx = (workers_cxt *) palloc(sizeof(workers_cxt));
+		userctx->cur_idx = 0;
+
+		/* Create tuple descriptor */
+		tupdesc = CreateTemplateTupleDesc(2, false);
+
+		TupleDescInitEntry(tupdesc, 1,
+						   "database", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 2,
+						   "status", TEXTOID, -1, 0);
+
+		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+		funcctx->user_fctx = (void *) userctx;
+
+		MemoryContextSwitchTo(old_mcxt);
+	}
+
+	funcctx = SRF_PERCALL_SETUP();
+	userctx = (workers_cxt *) funcctx->user_fctx;
+
+	/* Iterate through worker slots */
+	for (i = userctx->cur_idx; i < MAX_WORKERS; i++)
+	{
+		// ConcurrentPartSlot *cur_slot = &concurrent_part_slots[i];
+		HeapTuple			htup = NULL;
+
+		// HOLD_INTERRUPTS();
+		// SpinLockAcquire(&cur_slot->mutex);
+
+		if (worker_data[i].status != WS_STOPPED)
+		{
+			Datum		values[2];
+			bool		isnull[2] = { 0 };
+
+			values[0] = PointerGetDatum(cstring_to_text(worker_data[i].dbname));
+			switch(worker_data[i].status)
+			{
+				case WS_ACTIVE:
+					values[1] = PointerGetDatum(cstring_to_text("active"));
+					break;
+				case WS_STOPPING:
+					values[1] = PointerGetDatum(cstring_to_text("stopping"));
+					break;
+				case WS_STARTING:
+					values[1] = PointerGetDatum(cstring_to_text("starting"));
+					break;
+				default:
+					values[1] = PointerGetDatum(cstring_to_text("[unknown]"));
+			}
+
+			/* Form output tuple */
+			htup = heap_form_tuple(funcctx->tuple_desc, values, isnull);
+
+			/* Switch to next worker */
+			userctx->cur_idx = i + 1;
+		}
+
+		// SpinLockRelease(&cur_slot->mutex);
+		// RESUME_INTERRUPTS();
+
+		/* Return tuple if needed */
+		if (htup)
+			SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(htup));
+	}
+
+	SRF_RETURN_DONE(funcctx);
+}
+
 static void
 start_bgworker_dynamic(void)
 {
-	BackgroundWorker		worker;
+	BackgroundWorker worker;
 	BackgroundWorkerHandle *bgw_handle;
-	pid_t					pid;
+	pid_t		pid;
+	int			idx;
+
+	idx = acquire_slot(get_database_name(MyDatabaseId));
 
 	/* Initialize worker struct */
-	memcpy(worker.bgw_name, "pageprep_worker", BGW_MAXLEN);
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", worker_data[idx].dbname);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
@@ -346,7 +447,7 @@ start_bgworker_dynamic(void)
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	worker.bgw_main_arg			= 0;
+	worker.bgw_main_arg			= idx;
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Start dynamic worker */
@@ -359,9 +460,12 @@ start_bgworker_dynamic(void)
 }
 
 static void
-start_bgworker_permanent(int idx, const char *dbname)
+start_bgworker_permanent(const char *dbname)
 {
 	BackgroundWorker		worker;
+	int		idx;
+
+	idx = acquire_slot(dbname);
 
 	/* Initialize worker struct */
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
@@ -380,6 +484,37 @@ start_bgworker_permanent(int idx, const char *dbname)
 	RegisterBackgroundWorker(&worker);
 }
 
+static int
+acquire_slot(const char *dbname)
+{
+	int idx;
+	int ret = -1;
+
+	/* Find available worker slot */
+	for (idx = 0; idx < MAX_WORKERS; idx++)
+	{
+		if (strcmp(worker_data[idx].dbname, dbname) == 0)
+		{
+			if (ret >= 0)
+				worker_data[ret].status = WS_STOPPED;
+
+			elog(ERROR, "The worker for '%s' database is already started",
+				 dbname);
+		}
+
+		if (ret < 0 && worker_data[idx].status == WS_STOPPED)
+		{
+			ret = idx;
+			worker_data[ret].status = WS_STARTING;
+			strcpy(worker_data[ret].dbname, dbname);
+		}
+	}
+	if (ret < 0)
+		elog(ERROR, "No available worker slots left");
+
+	return ret;
+}
+
 /*
  * worker_main
  *		Workers' main routine
@@ -387,14 +522,17 @@ start_bgworker_permanent(int idx, const char *dbname)
 void
 worker_main(Datum idx_datum)
 {
-	char		   *databases_string;
-	List		   *databases;
+	MyWorkerIndex = DatumGetInt32(idx_datum);
+
+	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+	{
+		worker_data[MyWorkerIndex].status = WS_STOPPED;
+		return;
+	}
 
 	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
 	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
-
-	MyWorkerIndex = DatumGetInt32(idx_datum);
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -404,16 +542,6 @@ worker_main(Datum idx_datum)
 
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
-
-	/* Retrieve database name */
-	databases_string = pstrdup(pg_pageprep_databases);
-	if (!SplitIdentifierString(databases_string, ',', &databases))
-	{
-		elog(ERROR, "Cannot parse databases list");
-	}
-	strcpy(worker_data[MyWorkerIndex].dbname,
-		   (char *) list_nth(databases, MyWorkerIndex));
-	pfree(databases_string);
 
 	/* Establish connection and start transaction */
 	BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
@@ -988,6 +1116,8 @@ update_fillfactor(Oid relid)
 
 		SPI_exec(query, 0);
 		SPI_finish();
+
+		/* TODO: Do we need to invalidate relcache here? */
 	}
 	else
 		elog(ERROR, "Couldn't establish SPI connections");

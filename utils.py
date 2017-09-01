@@ -15,7 +15,7 @@ class DbConnector:
             self.db,
             "-U", self.role,
             "-c", sql,
-            "-F','", "-t", "-A"],
+            "-F,", "-t", "-A"],
             stdout=subprocess.PIPE)
         out, _ = p.communicate()
         return out

@@ -31,6 +31,11 @@ create or replace function stop_bgworker()
 returns void as 'MODULE_PATHNAME', 'stop_bgworker'
 language c strict;
 
+create or replace function get_workers_list()
+returns TABLE (database text, status text)
+as 'MODULE_PATHNAME', 'get_workers_list'
+language c strict;
+
 create view pg_pageprep_todo as (
 	select c.oid, c.relname, p.status
 	from pg_class c
