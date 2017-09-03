@@ -83,6 +83,34 @@ typedef struct
 	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
 } Worker;
 
+/*
+ * The worker argument means different things depending on the way worker is
+ * started. There are two cases:
+ *	1. The worker is started dynamically. In this case worker_data array is
+ *		already initialized and worker_arg is the index in worker_data;
+ *	2. The worker is started in postmaster. In this case worker_arg represents
+ *		the index in pg_pageprep.databases list (since shared data isn't yet
+ *		initialized and we cannot use worker_data yet)
+ */
+typedef uint32 worker_arg;
+
+#define WORKER_ARG_TYPE_MASK	(1 << 31)
+#define WORKER_ARG_INDEX_MASK	(~(1 << 31))
+#define WORKER_ARG_TYPE(arg)	(((arg) & WORKER_ARG_TYPE_MASK) >> 31)
+#define WORKER_ARG_INDEX(arg)	((arg) & WORKER_ARG_INDEX_MASK)
+#define WORKER_ARG_SET_TYPE(arg, type)		\
+	do {									\
+		arg = arg | (type << 31);			\
+	} while (0)
+#define WORKER_ARG_SET_INDEX(arg, index)	\
+	do {									\
+		arg = (arg & WORKER_ARG_TYPE_MASK) | (index & WORKER_ARG_INDEX_MASK); \
+	} while (0)
+
+#define WORKER_SLOT_INDEX 0		/* index in workers_data */
+#define DATABASES_GUC_INDEX 1	/* index in pg_pageprep.databases list */
+
+
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
@@ -92,11 +120,6 @@ static Worker *worker_data;
 int MyWorkerIndex = 0;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
-
-#define RELATIONS_QUERY "SELECT * FROM %s.pg_pageprep_todo"
-
-#define Anum_task_relid		1
-#define Anum_task_status	2
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
@@ -124,8 +147,9 @@ void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
 static void start_bgworker_dynamic(void);
-static void start_bgworker_permanent(const char *dbname);
+static void start_bgworker_permanent(unsigned idx, const char *dbname);
 static int acquire_slot(const char *dbname);
+static int find_database_slot(const char *dbname);
 void worker_main(Datum segment_handle);
 static Oid get_extension_schema(void);
 static Oid get_next_relation(void);
@@ -144,9 +168,10 @@ static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 void
 _PG_init(void)
 {
-	char *databases_string;
-	List *databases;
-	ListCell *lc;
+	char	   *databases_string;
+	List	   *databases;
+	ListCell   *lc;
+	int			idx = 0;
 
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
@@ -158,7 +183,7 @@ _PG_init(void)
     if (!process_shared_preload_libraries_in_progress)
         return;
 
-    /* Split databases string into list */
+	/* Split databases string into list */
 	databases_string = pstrdup(pg_pageprep_databases);
 	if (!SplitIdentifierString(databases_string, ',', &databases))
 	{
@@ -171,7 +196,8 @@ _PG_init(void)
 	{
 		char *dbname = lfirst(lc);
 
-		start_bgworker_permanent(dbname);
+		start_bgworker_permanent(idx, dbname);
+		idx++;
 	}
 }
 
@@ -233,7 +259,7 @@ setup_guc_variables(void)
                             "Comma separated list of databases",
                             NULL,
                             &pg_pageprep_databases,
-                            "postgres",
+                            "",
                             PGC_SIGHUP,
                             0,
                             NULL,
@@ -300,16 +326,21 @@ scan_pages(PG_FUNCTION_ARGS)
 Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
-	switch (worker_data[MyWorkerIndex].status)
+	int idx = find_database_slot(get_database_name(MyDatabaseId));
+
+	if (idx >= 0)
 	{
-		case WS_STOPPING:
-			elog(ERROR, "The worker is being stopped");
-		case WS_STARTING:
-			elog(ERROR, "The worker is being started");
-		case WS_ACTIVE:
-			elog(ERROR, "The worker is already started");
-		default:
-			;
+		switch (worker_data[idx].status)
+		{
+			case WS_STOPPING:
+				elog(ERROR, "The worker is being stopped");
+			case WS_STARTING:
+				elog(ERROR, "The worker is being started");
+			case WS_ACTIVE:
+				elog(ERROR, "The worker is already started");
+			default:
+				;
+		}
 	}
 
 	start_bgworker_dynamic();
@@ -319,7 +350,12 @@ start_bgworker(PG_FUNCTION_ARGS)
 Datum
 stop_bgworker(PG_FUNCTION_ARGS)
 {
-	switch (worker_data[MyWorkerIndex].status)
+	int idx = find_database_slot(get_database_name(MyDatabaseId));
+
+	if (idx < 0)
+		elog(ERROR, "The worker isn't started");
+
+	switch (worker_data[idx].status)
 	{
 		case WS_STOPPED:
 			elog(ERROR, "The worker isn't started");
@@ -327,7 +363,7 @@ stop_bgworker(PG_FUNCTION_ARGS)
 			elog(ERROR, "The worker is being stopped");
 		case WS_ACTIVE:
 			elog(NOTICE, "Stop signal has been sent");
-			worker_data[MyWorkerIndex].status = WS_STOPPING;
+			worker_data[idx].status = WS_STOPPING;
 			break;
 		default:
 			elog(ERROR, "Unknown status");
@@ -433,12 +469,15 @@ start_bgworker_dynamic(void)
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t		pid;
-	int			idx;
+	worker_arg	arg = 0;
 
-	idx = acquire_slot(get_database_name(MyDatabaseId));
+	WORKER_ARG_SET_TYPE(arg, WORKER_SLOT_INDEX);
+	WORKER_ARG_SET_INDEX(arg, acquire_slot(get_database_name(MyDatabaseId)));
 
 	/* Initialize worker struct */
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", worker_data[idx].dbname);
+	snprintf(worker.bgw_name, BGW_MAXLEN,
+			 "pg_pageprep (%s)",
+			 worker_data[WORKER_ARG_INDEX(arg)].dbname);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
@@ -447,7 +486,7 @@ start_bgworker_dynamic(void)
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	worker.bgw_main_arg			= idx;
+	worker.bgw_main_arg			= arg;
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Start dynamic worker */
@@ -460,24 +499,26 @@ start_bgworker_dynamic(void)
 }
 
 static void
-start_bgworker_permanent(const char *dbname)
+start_bgworker_permanent(unsigned idx, const char *dbname)
 {
-	BackgroundWorker		worker;
-	int		idx;
-
-	idx = acquire_slot(dbname);
+	BackgroundWorker	worker;
+	worker_arg			arg;
 
 	/* Initialize worker struct */
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
+	// memcpy(worker.bgw_name, "pg_pageprep", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+
+	WORKER_ARG_SET_TYPE(arg, DATABASES_GUC_INDEX);
+	WORKER_ARG_SET_INDEX(arg, idx);
 
 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
 	worker.bgw_main				= NULL;
-	worker.bgw_main_arg			= idx;
+	worker.bgw_main_arg			= *(int*) &arg;
 	worker.bgw_notify_pid		= 0;
 
 	/* Start dynamic worker */
@@ -493,7 +534,8 @@ acquire_slot(const char *dbname)
 	/* Find available worker slot */
 	for (idx = 0; idx < MAX_WORKERS; idx++)
 	{
-		if (strcmp(worker_data[idx].dbname, dbname) == 0)
+		if (strcmp(worker_data[idx].dbname, dbname) == 0
+			&& worker_data[idx].status != WS_STOPPED)
 		{
 			if (ret >= 0)
 				worker_data[ret].status = WS_STOPPED;
@@ -515,6 +557,18 @@ acquire_slot(const char *dbname)
 	return ret;
 }
 
+static int
+find_database_slot(const char *dbname)
+{
+	int idx;
+
+	for (idx = 0; idx < MAX_WORKERS; idx++)
+		if (strcmp(worker_data[idx].dbname, dbname) == 0)
+			return idx;
+
+	return -1;
+}
+
 /*
  * worker_main
  *		Workers' main routine
@@ -522,7 +576,34 @@ acquire_slot(const char *dbname)
 void
 worker_main(Datum idx_datum)
 {
-	MyWorkerIndex = DatumGetInt32(idx_datum);
+	worker_arg	arg = (worker_arg) idx_datum;
+
+	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
+	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+
+	/*
+	 * If it isn't a dynamically started worker, aquire a slot in worker_data
+	 * array. See comment to worker_arg struct for more information.
+	 */
+	if (WORKER_ARG_TYPE(arg) == DATABASES_GUC_INDEX)
+	{
+		char	   *databases_string;
+		List	   *databases;
+		char	   *dbname;
+
+		/* Split databases string into list */
+		databases_string = pstrdup(pg_pageprep_databases);
+		if (!SplitIdentifierString(databases_string, ',', &databases))
+		{
+			pfree(databases_string);
+			elog(ERROR, "Cannot parse databases list");
+		}
+
+		dbname = list_nth(databases, WORKER_ARG_INDEX(arg));
+		MyWorkerIndex = acquire_slot(dbname);
+	}
+	else
+		MyWorkerIndex = WORKER_ARG_INDEX(arg);
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
@@ -530,9 +611,8 @@ worker_main(Datum idx_datum)
 		return;
 	}
 
-	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
-	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+	//pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -670,7 +750,7 @@ get_next_relation(void)
 	{
 		char *query;
 
-		query = psprintf(RELATIONS_QUERY,
+		query = psprintf("SELECT * FROM %s.pg_pageprep_todo",
 						 get_namespace_name(get_extension_schema()));
 
 		if (SPI_exec(query, 0) != SPI_OK_SELECT)
@@ -684,7 +764,7 @@ get_next_relation(void)
 
 			datum = SPI_getbinval(SPI_tuptable->vals[0],
 								  SPI_tuptable->tupdesc,
-								  Anum_task_relid,
+								  1,
 								  &isnull);
 			if (isnull)
 				elog(ERROR, "get_next_relation(): relid is NULL");
