@@ -29,7 +29,10 @@ def stop(databases):
 def status(databases):
     con = utils.DbConnector(databases[0], args.role)
     show_workers_list(con)
-    show_todo_lists(databases)
+    all_done = show_todo_lists(databases)
+
+    if args.emit_error:
+        exit(0 if all_done else 1)
 
 
 def show_workers_list(con):
@@ -45,6 +48,8 @@ def show_workers_list(con):
 
 
 def show_todo_lists(databases):
+    all_done = True
+
     for db in databases:
         print("\n'{}' database todo list:".format(db))
 
@@ -53,24 +58,41 @@ def show_todo_lists(databases):
         jobs = jobs.strip()
 
         if jobs:
+            all_done = False
             for job in jobs.split():
                 print("\t" + job)
         else:
             print("\tAll done!")
+
+    return all_done
+
+
+def restore(databases):
+    stop(databases)
+
+    con = utils.DbConnector(databases[0], args.role)
+    con.exec_query(
+        "alter system set pg_pageprep.databases='{}'".format(','.join(databases)))
+
+    for db in databases:
+        con = utils.DbConnector(db, args.role)
+        con.exec_query("select __restore_fillfactors()")
 
 
 funcs = {
     'install': install,
     'start': start,
     'stop': stop,
-    'status': status
+    'status': status,
+    'restore': restore
 }
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('-d', '--databases', help='Coma separated databases list (required)', required=True)
-    parser.add_argument('-U','--username', dest='role', help='Role', default='postgres', required=True)
+    parser.add_argument('-U', '--username', dest='role', help='Role', default='postgres', required=True)
+    parser.add_argument('--emit_error', action='store_true', default=None, help=argparse.SUPPRESS)
     parser.add_argument('command', nargs='?', help='command (start, stop, status)')
     args = parser.parse_args()
 

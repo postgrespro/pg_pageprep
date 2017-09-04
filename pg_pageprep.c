@@ -26,6 +26,7 @@
 #include "storage/latch.h"
 #include "storage/procarray.h"
 #include "utils/guc.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -1197,44 +1198,12 @@ update_fillfactor(Oid relid)
 		SPI_exec(query, 0);
 		SPI_finish();
 
-		/* TODO: Do we need to invalidate relcache here? */
+		/* Invalidate relcache */
+		CacheInvalidateRelcacheByRelid(relid);
 	}
 	else
 		elog(ERROR, "Couldn't establish SPI connections");
 }
-
-// static void
-// update_fillfactor(Oid relid)
-// {
-// 	Relation		rel;
-// 	RangeVar	   *rangevar;
-// 	AlterTableStmt *stmt = makeNode(AlterTableStmt);
-// 	AlterTableCmd  *cmd = makeNode(AlterTableCmd);
-// 	DefElem		   *elem;
-// 	LOCKMODE		lockmode;
-
-// #if PG_VERSION_NUM < 100000
-// 	elem = makeDefElem("fillfactor", (Node *) makeInteger(FILLFACTOR));
-// #else
-// 	elem = makeDefElem("fillfactor", (Node *) makeInteger(FILLFACTOR), -1);
-// #endif
-
-// 	cmd->subtype = AT_SetRelOptions;
-// 	cmd->def = (Node *) list_make1(elem);
-
-// 	rel = heap_open(relid, AccessShareLock);
-
-// 	rangevar = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
-// 							RelationGetRelationName(rel),
-// 							-1);
-
-// 	stmt->relation = rangevar;
-// 	stmt->cmds = list_make1(cmd);
-// 	heap_close(rel, AccessShareLock);
-
-// 	lockmode = AlterTableGetRelOptionsLockLevel((List *) cmd->def);
-// 	AlterTable(relid, lockmode, stmt);
-// }
 
 static void
 print_tuple(TupleDesc tupdesc, HeapTuple tuple)
@@ -1249,7 +1218,5 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 	print_slot(slot);
 
 	ReleaseTupleDesc(tupdesc);
-
-	// pfree(slot);
 }
 
