@@ -174,6 +174,13 @@ _PG_init(void)
 	ListCell   *lc;
 	int			idx = 0;
 
+	if (!process_shared_preload_libraries_in_progress)
+	{
+		ereport(ERROR,
+				(errmsg("pg_pageprep module must be initialized in postmaster."),
+				 errhint("add pg_pageprep to shared_preload_libraries parameter in postgresql.conf")));
+	}
+
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_pageprep_shmem_startup_hook;
 
@@ -334,11 +341,11 @@ start_bgworker(PG_FUNCTION_ARGS)
 		switch (worker_data[idx].status)
 		{
 			case WS_STOPPING:
-				elog(ERROR, "The worker is being stopped");
+				elog(ERROR, "pg_pageprep: the worker is being stopped");
 			case WS_STARTING:
-				elog(ERROR, "The worker is being started");
+				elog(ERROR, "pg_pageprep: the worker is being started");
 			case WS_ACTIVE:
-				elog(ERROR, "The worker is already started");
+				elog(ERROR, "pg_pageprep: the worker is already started");
 			default:
 				;
 		}
@@ -354,20 +361,20 @@ stop_bgworker(PG_FUNCTION_ARGS)
 	int idx = find_database_slot(get_database_name(MyDatabaseId));
 
 	if (idx < 0)
-		elog(ERROR, "The worker isn't started");
+		elog(ERROR, "pg_pageprep: the worker isn't started");
 
 	switch (worker_data[idx].status)
 	{
 		case WS_STOPPED:
-			elog(ERROR, "The worker isn't started");
+			elog(ERROR, "pg_pageprep: the worker isn't started");
 		case WS_STOPPING:
-			elog(ERROR, "The worker is being stopped");
+			elog(ERROR, "pg_pageprep: the worker is being stopped");
 		case WS_ACTIVE:
-			elog(NOTICE, "Stop signal has been sent");
+			elog(NOTICE, "pg_pageprep: stop signal has been sent");
 			worker_data[idx].status = WS_STOPPING;
 			break;
 		default:
-			elog(ERROR, "Unknown status");
+			elog(ERROR, "pg_pageprep: unknown status");
 	}
 	PG_RETURN_VOID();
 }
@@ -492,7 +499,7 @@ start_bgworker_dynamic(void)
 
 	/* Start dynamic worker */
 	if (!RegisterDynamicBackgroundWorker(&worker, &bgw_handle))
-		elog(ERROR, "Cannot start bgworker");
+		elog(ERROR, "pg_pageprep: cannot start bgworker");
 
 	/* Wait till the worker starts */
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
@@ -507,7 +514,6 @@ start_bgworker_permanent(unsigned idx, const char *dbname)
 
 	/* Initialize worker struct */
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
-	// memcpy(worker.bgw_name, "pg_pageprep", BGW_MAXLEN);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
@@ -541,7 +547,7 @@ acquire_slot(const char *dbname)
 			if (ret >= 0)
 				worker_data[ret].status = WS_STOPPED;
 
-			elog(ERROR, "The worker for '%s' database is already started",
+			elog(ERROR, "pg_pageprep: the worker for '%s' database is already started",
 				 dbname);
 		}
 
@@ -553,7 +559,7 @@ acquire_slot(const char *dbname)
 		}
 	}
 	if (ret < 0)
-		elog(ERROR, "No available worker slots left");
+		elog(ERROR, "pg_pageprep: no available worker slots left");
 
 	return ret;
 }
@@ -579,8 +585,8 @@ worker_main(Datum idx_datum)
 {
 	worker_arg	arg = (worker_arg) idx_datum;
 
-	elog(WARNING, "pg_pageprep worker started: %u (pid)", MyProcPid);
-	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+	elog(LOG, "pg_pageprep: worker is started (pid: %u)", MyProcPid);
+	//pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	/*
 	 * If it isn't a dynamically started worker, aquire a slot in worker_data
@@ -597,7 +603,7 @@ worker_main(Datum idx_datum)
 		if (!SplitIdentifierString(databases_string, ',', &databases))
 		{
 			pfree(databases_string);
-			elog(ERROR, "Cannot parse databases list");
+			elog(ERROR, "pg_pageprep: cannot parse pg_pageprep.databases list");
 		}
 
 		dbname = list_nth(databases, WORKER_ARG_INDEX(arg));
@@ -697,7 +703,7 @@ worker_main(Datum idx_datum)
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
-		elog(NOTICE, "Worker has been stopped");
+		elog(LOG, "pg_pageprep: worker has been stopped");
 		worker_data[MyWorkerIndex].status = WS_STOPPED;
 	}
 }
@@ -720,7 +726,7 @@ get_extension_schema(void)
 	else
 	{
 		if (SPI_exec(EXTENSION_QUERY, 0) != SPI_OK_SELECT)
-			elog(ERROR, "get_extension_schema(): failed to execute query");
+			elog(ERROR, "pg_pageprep::get_extension_schema(): failed to execute query");
 
 		if (SPI_processed > 0)
 		{
@@ -733,8 +739,8 @@ get_extension_schema(void)
 
 		if (!OidIsValid(res))
 			ereport(ERROR,
-					(errmsg("Failed to get pg_pageprep extension schema"),
-					 errhint("Perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
+					(errmsg("failed to get pg_pageprep extension schema"),
+					 errhint("perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
 
 		worker_data[MyWorkerIndex].ext_schema = res;
 	}
@@ -755,7 +761,7 @@ get_next_relation(void)
 						 get_namespace_name(get_extension_schema()));
 
 		if (SPI_exec(query, 0) != SPI_OK_SELECT)
-			elog(ERROR, "get_next_relation() failed");
+			elog(ERROR, "pg_pageprep::get_next_relation() failed");
 
 		/* At least one relation needs to be processed */
 		if (SPI_processed > 0)
@@ -768,7 +774,7 @@ get_next_relation(void)
 								  1,
 								  &isnull);
 			if (isnull)
-				elog(ERROR, "get_next_relation(): relid is NULL");
+				elog(ERROR, "pg_pageprep::get_next_relation(): relid is NULL");
 
 			relid = DatumGetObjectId(datum);
 		}
@@ -777,7 +783,7 @@ get_next_relation(void)
 		SPI_finish();
 	}
 	else
-		elog(ERROR, "Couldn't establish SPI connections");
+		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
 
 	return relid;
 }
@@ -797,7 +803,7 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 		 * Scan heap
 		 */
 		rel = heap_open(relid, AccessShareLock);
-		elog(NOTICE, "scanning pages for %s", RelationGetRelationName(rel));
+		elog(LOG, "pg_pageprep: scanning pages for %s", RelationGetRelationName(rel));
 
 		for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 		{
@@ -847,7 +853,7 @@ retry:
 				if (can_free_some_space)
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-					elog(NOTICE, "%s blkno=%u: can free some space",
+					elog(NOTICE, "pg_pageprep: %s blkno=%u: can free some space",
 						 RelationGetRelationName(rel),
 						 blkno);
 				}
@@ -869,7 +875,7 @@ retry:
 					 * page
 					 */
 					if (!tuple)
-						elog(ERROR, "%s blkno=%u: cannot free any space",
+						elog(ERROR, "pg_pageprep: %s blkno=%u: cannot free any space",
 							 RelationGetRelationName(rel),
 							 blkno);
 
@@ -911,7 +917,7 @@ retry:
 	}
 	PG_END_TRY();
 
-	elog(NOTICE, "finish page scan for %s", RelationGetRelationName(rel));
+	elog(LOG, "pg_pageprep: finish page scan for %s", RelationGetRelationName(rel));
 	heap_close(rel, AccessShareLock);
 
 	return success;
@@ -1037,12 +1043,6 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 static bool
 update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 {
-	// HeapTupleHeader tuphead;
-
-	/* Update tuple will force creation of new tuple in another page */
-	// simple_heap_update(rel, &(tuple->t_self), tuple);
-	// heap_update(rel, &(tuple->t_self), tuple, );
-
 	bool ret;
 	HTSU_Result result;
 	HeapUpdateFailureData hufd;
@@ -1069,7 +1069,7 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 			break;
 
 		default:
-			elog(ERROR, "unrecognized heap_update status: %u", result);
+			elog(ERROR, "pg_pageprep: unrecognized heap_update status: %u", result);
 			break;
 	}
 
@@ -1149,7 +1149,7 @@ update_status(Oid relid, TaskStatus status)
 		SPI_finish();
 	}
 	else
-		elog(ERROR, "Couldn't establish SPI connections");
+		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
 }
 
 static void
@@ -1202,7 +1202,7 @@ update_fillfactor(Oid relid)
 		CacheInvalidateRelcacheByRelid(relid);
 	}
 	else
-		elog(ERROR, "Couldn't establish SPI connections");
+		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
 }
 
 static void

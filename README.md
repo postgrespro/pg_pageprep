@@ -18,7 +18,13 @@ or if postgres binaries are not on PATH
 make install USE_PGXS=1 PG_CONFIG=/path/to/pg_config
 ```
 
-After that perform `CREATE EXTENSION pg_pageprep;` on each database in cluster.
+Add `pg_pageprep` to `shared_preload_libraries` parameter in `postgresql.conf`:
+
+```
+shared_preload_libraries='pg_pageprep'
+```
+
+It is required to restart PostgreSQL cluster in order to apply new configuration. After that perform `CREATE EXTENSION pg_pageprep;` on each database in cluster.
 
 # Configuration
 
