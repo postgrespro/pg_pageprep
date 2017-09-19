@@ -17,13 +17,17 @@ def install(databases):
 def start(databases):
     for db in databases:
         local_con = utils.DbConnector(db, args.role)
-        local_con.exec_query("select start_bgworker();")
+
+        if extension_exists(local_con):
+            local_con.exec_query("select start_bgworker();")
 
 
 def stop(databases):
     for db in databases:
         local_con = utils.DbConnector(db, args.role)
-        local_con.exec_query("select stop_bgworker();")
+
+        if extension_exists(local_con):
+            local_con.exec_query("select stop_bgworker();")
 
 
 def status(databases):
@@ -54,6 +58,9 @@ def show_todo_lists(databases):
         print("\n'{}' database todo list:".format(db))
 
         con = utils.DbConnector(db, args.role)
+        if not extension_exists(con):
+            continue
+
         jobs = con.exec_query("select relname from pg_pageprep_todo")
         jobs = jobs.strip()
 
@@ -67,6 +74,14 @@ def show_todo_lists(databases):
     return all_done
 
 
+def extension_exists(con):
+    ext_created = con.exec_query("select exists (select * from pg_extension where extname = 'pg_pageprep')")
+    if ext_created.strip() != 't':
+        print("ERROR: pg_pageprep extension doesn't exist in '{}' database!".format(con.db))
+        return False
+    return True
+
+
 def restore(databases):
     stop(databases)
 
@@ -76,27 +91,31 @@ def restore(databases):
 
     for db in databases:
         con = utils.DbConnector(db, args.role)
-        con.exec_query("select __restore_fillfactors()")
+        if extension_exists(con):
+            con.exec_query("select __restore_fillfactors()")
 
 
 funcs = {
-    'install': install,
-    'start': start,
-    'stop': stop,
-    'status': status,
-    'restore': restore
+    "install": install,
+    "start": start,
+    "stop": stop,
+    "status": status,
+    "restore": restore
 }
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--databases', help='Coma separated databases list (required)', required=True)
-    parser.add_argument('-U', '--username', dest='role', help='Role', default='postgres', required=True)
-    parser.add_argument('--emit_error', action='store_true', default=None, help=argparse.SUPPRESS)
-    parser.add_argument('command', nargs='?', help='command (start, stop, status)')
+    parser.add_argument("-d", "--database", help="Database name (required)", required=True)
+    parser.add_argument("-U", "--username", dest="role", help="Role", default="postgres", required=True)
+    parser.add_argument("--emit_error", action="store_true", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("command", nargs="?", help="command (start, stop, status)")
     args = parser.parse_args()
 
-    databases = [x.strip() for x in args.databases.split(",")]
+    # databases = [x.strip() for x in args.databases.split(",")]
+    con = utils.DbConnector(args.database, args.role)
+    databases_str = con.exec_query("SELECT datname FROM pg_database WHERE datname != 'template0'")
+    databases = databases_str.split()
 
     if args.command in funcs:
         funcs[args.command](databases)
