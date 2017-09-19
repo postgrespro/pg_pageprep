@@ -42,7 +42,7 @@ PG_MODULE_MAGIC;
 
 #define NEEDED_SPACE_SIZE 28
 #define FILLFACTOR 90
-#define MAX_WORKERS 10
+#define MAX_WORKERS 100
 
 /*
  * TODOs:
@@ -115,7 +115,8 @@ typedef uint32 worker_arg;
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
-static char *pg_pageprep_databases = NULL;
+// static char *pg_pageprep_databases = NULL;
+static char *pg_pageprep_database = NULL;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
 int MyWorkerIndex = 0;
@@ -147,8 +148,10 @@ PG_FUNCTION_INFO_V1(get_workers_list);
 void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
-static void start_bgworker_dynamic(void);
-static void start_bgworker_permanent(unsigned idx, const char *dbname);
+static void start_starter(void);
+void starter_main(Datum dummy);
+static void start_bgworker_dynamic(const char *dbname);
+// static void start_bgworker_permanent(unsigned idx, const char *dbname);
 static int acquire_slot(const char *dbname);
 static int find_database_slot(const char *dbname);
 void worker_main(Datum segment_handle);
@@ -169,10 +172,10 @@ static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 void
 _PG_init(void)
 {
-	char	   *databases_string;
-	List	   *databases;
-	ListCell   *lc;
-	int			idx = 0;
+	// char	   *databases_string;
+	// List	   *databases;
+	// ListCell   *lc;
+	// int			idx = 0;
 
 	if (!process_shared_preload_libraries_in_progress)
 	{
@@ -191,22 +194,24 @@ _PG_init(void)
     if (!process_shared_preload_libraries_in_progress)
         return;
 
+    start_starter();
+
 	/* Split databases string into list */
-	databases_string = pstrdup(pg_pageprep_databases);
-	if (!SplitIdentifierString(databases_string, ',', &databases))
-	{
-		pfree(databases_string);
-		elog(ERROR, "Cannot parse databases list");
-	}
+	// databases_string = pstrdup(pg_pageprep_databases);
+	// if (!SplitIdentifierString(databases_string, ',', &databases))
+	// {
+	// 	pfree(databases_string);
+	// 	elog(ERROR, "Cannot parse databases list");
+	// }
 
-	/* Populate workers */
-	foreach(lc, databases)
-	{
-		char *dbname = lfirst(lc);
+	// /* Populate workers */
+	// foreach(lc, databases)
+	// {
+	// 	char *dbname = lfirst(lc);
 
-		start_bgworker_permanent(idx, dbname);
-		idx++;
-	}
+	// 	start_bgworker_permanent(idx, dbname);
+	// 	idx++;
+	// }
 }
 
 static void
@@ -263,10 +268,20 @@ setup_guc_variables(void)
                             NULL,
                             NULL);
 
-    DefineCustomStringVariable("pg_pageprep.databases",
-                            "Comma separated list of databases",
+    // DefineCustomStringVariable("pg_pageprep.databases",
+    //                         "Comma separated list of databases",
+    //                         NULL,
+    //                         &pg_pageprep_databases,
+    //                         "",
+    //                         PGC_SIGHUP,
+    //                         0,
+    //                         NULL,
+    //                         NULL,	/* TODO: disallow to change it in runtime */
+    //                         NULL);
+    DefineCustomStringVariable("pg_pageprep.database",
+                            "Database name",
                             NULL,
-                            &pg_pageprep_databases,
+                            &pg_pageprep_database,
                             "",
                             PGC_SIGHUP,
                             0,
@@ -351,7 +366,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 		}
 	}
 
-	start_bgworker_dynamic();
+	start_bgworker_dynamic(NULL);
 	PG_RETURN_VOID();
 }
 
@@ -472,15 +487,96 @@ get_workers_list(PG_FUNCTION_ARGS)
 }
 
 static void
-start_bgworker_dynamic(void)
+start_starter(void)
+{
+	BackgroundWorker	worker;
+
+	/* Initialize worker struct */
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep starter");
+	memcpy(worker.bgw_function_name, CppAsString(starter_main), BGW_MAXLEN);
+	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+
+	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
+									BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
+	worker.bgw_restart_time		= BGW_NEVER_RESTART;
+	worker.bgw_main				= NULL;
+	worker.bgw_main_arg			= 0;
+	worker.bgw_notify_pid		= 0;
+
+	/* Start dynamic worker */
+	RegisterBackgroundWorker(&worker);
+}
+
+/*
+ * Background worker whose goal is to get the list of existing databases and
+ * start a worker for each of them (except for template0)
+ */
+void
+starter_main(Datum dummy)
+{
+	elog(LOG, "pg_pageprep: starter process (pid: %u)", MyProcPid);
+	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+
+	/* Establish signal handlers before unblocking signals */
+	pqsignal(SIGTERM, handle_sigterm);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Create resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
+
+	/* Establish connection and start transaction */
+	BackgroundWorkerInitializeConnection(pg_pageprep_database,
+										 pg_pageprep_role);
+
+	StartTransactionCommand();
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		int		i;
+
+		if (SPI_exec("SELECT datname FROM pg_database", 0) != SPI_OK_SELECT)
+			elog(ERROR, "pg_pageprep: failed to get databases list");
+
+		if (SPI_processed > 0)
+		{
+			for (i = 0; i < SPI_processed; i++)
+			{
+				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+				HeapTuple	tuple = SPI_tuptable->vals[i];
+				char	   *dbname;
+				
+				dbname = SPI_getvalue(tuple, tupdesc, 1);
+				if (strcmp(dbname, "template0") == 0)
+					continue;
+
+				start_bgworker_dynamic(dbname);
+			}
+		}
+	}
+
+	SPI_finish();
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+}
+
+static void
+start_bgworker_dynamic(const char *dbname)
 {
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t		pid;
 	worker_arg	arg = 0;
 
+	if (!dbname)
+		dbname = get_database_name(MyDatabaseId);
+
 	WORKER_ARG_SET_TYPE(arg, WORKER_SLOT_INDEX);
-	WORKER_ARG_SET_INDEX(arg, acquire_slot(get_database_name(MyDatabaseId)));
+	WORKER_ARG_SET_INDEX(arg, acquire_slot(dbname));
 
 	/* Initialize worker struct */
 	snprintf(worker.bgw_name, BGW_MAXLEN,
@@ -506,31 +602,31 @@ start_bgworker_dynamic(void)
 		elog(ERROR, "Postmaster died during bgworker startup");
 }
 
-static void
-start_bgworker_permanent(unsigned idx, const char *dbname)
-{
-	BackgroundWorker	worker;
-	worker_arg			arg;
+// static void
+// start_bgworker_permanent(unsigned idx, const char *dbname)
+// {
+// 	BackgroundWorker	worker;
+// 	worker_arg			arg;
 
-	/* Initialize worker struct */
-	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
-	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
-	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+// 	/* Initialize worker struct */
+// 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", dbname);
+// 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
+// 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
-	WORKER_ARG_SET_TYPE(arg, DATABASES_GUC_INDEX);
-	WORKER_ARG_SET_INDEX(arg, idx);
+// 	WORKER_ARG_SET_TYPE(arg, DATABASES_GUC_INDEX);
+// 	WORKER_ARG_SET_INDEX(arg, idx);
 
-	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
-									BGWORKER_BACKEND_DATABASE_CONNECTION;
-	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
-	worker.bgw_restart_time		= BGW_NEVER_RESTART;
-	worker.bgw_main				= NULL;
-	worker.bgw_main_arg			= *(int*) &arg;
-	worker.bgw_notify_pid		= 0;
+// 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
+// 									BGWORKER_BACKEND_DATABASE_CONNECTION;
+// 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
+// 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
+// 	worker.bgw_main				= NULL;
+// 	worker.bgw_main_arg			= *(int*) &arg;
+// 	worker.bgw_notify_pid		= 0;
 
-	/* Start dynamic worker */
-	RegisterBackgroundWorker(&worker);
-}
+// 	/* Start dynamic worker */
+// 	RegisterBackgroundWorker(&worker);
+// }
 
 static int
 acquire_slot(const char *dbname)
@@ -592,25 +688,25 @@ worker_main(Datum idx_datum)
 	 * If it isn't a dynamically started worker, aquire a slot in worker_data
 	 * array. See comment to worker_arg struct for more information.
 	 */
-	if (WORKER_ARG_TYPE(arg) == DATABASES_GUC_INDEX)
-	{
-		char	   *databases_string;
-		List	   *databases;
-		char	   *dbname;
+	// if (WORKER_ARG_TYPE(arg) == DATABASES_GUC_INDEX)
+	// {
+	// 	char	   *databases_string;
+	// 	List	   *databases;
+	// 	char	   *dbname;
 
-		/* Split databases string into list */
-		databases_string = pstrdup(pg_pageprep_databases);
-		if (!SplitIdentifierString(databases_string, ',', &databases))
-		{
-			pfree(databases_string);
-			elog(ERROR, "pg_pageprep: cannot parse pg_pageprep.databases list");
-		}
+	// 	/* Split databases string into list */
+	// 	databases_string = pstrdup(pg_pageprep_databases);
+	// 	if (!SplitIdentifierString(databases_string, ',', &databases))
+	// 	{
+	// 		pfree(databases_string);
+	// 		elog(ERROR, "pg_pageprep: cannot parse pg_pageprep.databases list");
+	// 	}
 
-		dbname = list_nth(databases, WORKER_ARG_INDEX(arg));
-		MyWorkerIndex = acquire_slot(dbname);
-	}
-	else
-		MyWorkerIndex = WORKER_ARG_INDEX(arg);
+	// 	dbname = list_nth(databases, WORKER_ARG_INDEX(arg));
+	// 	MyWorkerIndex = acquire_slot(dbname);
+	// }
+	// else
+	MyWorkerIndex = WORKER_ARG_INDEX(arg);
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
@@ -644,6 +740,7 @@ worker_main(Datum idx_datum)
 		CHECK_FOR_INTERRUPTS();
 
 		/* User sent stop signal */
+		/* TODO: use atomics here */
 		if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 		{
 			/*
@@ -739,7 +836,8 @@ get_extension_schema(void)
 
 		if (!OidIsValid(res))
 			ereport(ERROR,
-					(errmsg("failed to get pg_pageprep extension schema"),
+					(errmsg("failed to get pg_pageprep extension schema on '%s' database",
+							get_database_name(MyDatabaseId)),
 					 errhint("perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
 
 		worker_data[MyWorkerIndex].ext_schema = res;

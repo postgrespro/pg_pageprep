@@ -1,5 +1,3 @@
-/* TODO: add @extschema@ */
-
 create type pg_pageprep_status as enum (
 	'new',
 	'in progress',
