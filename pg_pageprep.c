@@ -104,6 +104,12 @@ static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 	HeapTupleHeaderGetRawXmax(tup)
 #endif
 
+#if PG_VERSION_NUM < 100000
+	#define GetOldestXmin_compat(rel) GetOldestXmin(rel, true)
+#else
+	#define GetOldestXmin_compat(rel) GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM)
+#endif
+
 /*
  * PL funcs
  */
@@ -129,7 +135,7 @@ static Oid get_extension_schema(void);
 static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum, bool *interrupted);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
-static bool can_remove_old_tuples(Page page, size_t *free_space);
+static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
@@ -806,6 +812,7 @@ retry:
 				continue;
 
 			/* TODO: Lock page */
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			header = (PageHeader) page;
 
@@ -824,8 +831,7 @@ retry:
 				 * Check if there are some dead or redundant tuples which could
 				 * be removed to free enough space for new page format
 				 */
-				LockBuffer(buf, BUFFER_LOCK_SHARE);	/* TODO: move it up */
-				can_free_some_space = can_remove_old_tuples(page, &free_space);
+				can_free_some_space = can_remove_old_tuples(rel, buf, blkno, &free_space);
 
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
@@ -873,11 +879,13 @@ retry:
 							goto retry;
 						}
 					}
+					goto release_buf;
 				}
 			}
 
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+release_buf:
 			ReleaseBuffer(buf);
-
 			pg_usleep(pg_pageprep_per_page_delay * 1000L);
 		}
 
@@ -906,11 +914,12 @@ retry:
  *		Can we remove old tuples in order to free enough space?
  */
 static bool
-can_remove_old_tuples(Page page, size_t *free_space)
+can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_space)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
 	ItemId			lp;
+	Page			page = BufferGetPage(buf);
 
 	lp_count = PageGetMaxOffsetNumber(page);
 
@@ -921,26 +930,22 @@ can_remove_old_tuples(Page page, size_t *free_space)
 		/* TODO: Probably we should check DEAD and UNUSED too */
 		if (ItemIdIsNormal(lp))
 		{
-			HeapTupleHeader tuple = (HeapTupleHeader) PageGetItem(page, lp);
+			TransactionId	xid = GetOldestXmin_compat(rel);
+			HeapTupleData	heaptup;
 
-			/*
-			 * Xmax isn't empty meaning this tuple is an old version and could
-			 * be removed to empty some space
-			 */
-			if (TransactionIdIsValid(HeapTupleHeaderGetRawXmax_compat(page, tuple)))
+			/* Build in-memory tuple representation */
+			heaptup.t_tableOid = RelationGetRelid(rel);
+			heaptup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+			heaptup.t_len = ItemIdGetLength(lp);
+			ItemPointerSet(&(heaptup.t_self), blkno, lp_offset);
+
+			/* Can we remove this tuple? */
+			if (HeapTupleSatisfiesVacuum(&heaptup, xid, buf) == HEAPTUPLE_DEAD)
 			{
-				/*
-				 * Skip deleted tuples which xmax isn't yet commited (or should
-				 * we probably collect list of such pages and retry later?)
-				 */
-				if (tuple->t_infomask & HEAP_XMAX_COMMITTED)
-				{
-					/* TODO: Does it include header length? */
-					*free_space += ItemIdGetLength(lp);
+				*free_space += ItemIdGetLength(lp);
 
-					if (*free_space >= NEEDED_SPACE_SIZE)
-						return true;
-				}
+				if (*free_space >= NEEDED_SPACE_SIZE)
+					return true;
 			}
 		}
 	}
