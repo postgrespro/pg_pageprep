@@ -5,7 +5,7 @@ import utils
 def install(databases):
     con = utils.DbConnector(databases[0], args.role)
     con.exec_query(
-        "alter system set pg_pageprep.databases='{}'".format(','.join(databases)))
+        "alter system set pg_pageprep.database='{}'".format(args.database))
     con.exec_query(
         "alter system set pg_pageprep.role='{}'".format(args.role))
 
@@ -84,10 +84,6 @@ def extension_exists(con):
 
 def restore(databases):
     stop(databases)
-
-    con = utils.DbConnector(databases[0], args.role)
-    con.exec_query(
-        "alter system set pg_pageprep.databases='{}'".format(','.join(databases)))
 
     for db in databases:
         con = utils.DbConnector(db, args.role)

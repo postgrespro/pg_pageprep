@@ -456,7 +456,7 @@ void
 starter_process_main(Datum dummy)
 {
 	elog(LOG, "pg_pageprep: starter process (pid: %u)", MyProcPid);
-	// pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+	pg_usleep(3  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -466,6 +466,12 @@ starter_process_main(Datum dummy)
 
 	/* Create resource owner */
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
+
+	if(RecoveryInProgress())
+	{
+		elog(LOG, "pg_pageprep: nothing to do in recovery mode");
+		return;
+	}
 
 	/* Establish connection and start transaction */
 	BackgroundWorkerInitializeConnection(pg_pageprep_database,

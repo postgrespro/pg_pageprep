@@ -9,6 +9,13 @@ class DbConnector:
         self.psql_path = get_psql_executable_path()
 
     def exec_query(self, sql):
+        try:
+            res = self.exec_query_throwable(sql)
+        except Exception:
+            res = ''
+        return res
+
+    def exec_query_throwable(self, sql):
 
         p = subprocess.Popen([
             self.psql_path,
@@ -18,6 +25,10 @@ class DbConnector:
             "-F,", "-t", "-A"],
             stdout=subprocess.PIPE)
         out, _ = p.communicate()
+
+        if p.returncode:
+            raise Exception("psql failed on query: {}".format(sql))
+
         return out
 
 
