@@ -25,6 +25,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/procarray.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -32,8 +33,6 @@
 #include "utils/snapmgr.h"
 #if PG_VERSION_NUM >= 100000
 #include "utils/varlena.h"
-#else
-#include "utils/builtins.h"
 #endif
 
 #ifdef PG_MODULE_MAGIC
@@ -440,7 +439,9 @@ start_starter_process(void)
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
+#if PG_VERSION_NUM < 100000
 	worker.bgw_main				= NULL;
+#endif
 	worker.bgw_main_arg			= 0;
 	worker.bgw_notify_pid		= 0;
 
@@ -533,7 +534,9 @@ start_bgworker_dynamic(const char *dbname)
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
 	worker.bgw_start_time		= BgWorkerStart_ConsistentState;
 	worker.bgw_restart_time		= BGW_NEVER_RESTART;
+#if PG_VERSION_NUM < 100000
 	worker.bgw_main				= NULL;
+#endif
 	worker.bgw_main_arg			= Int32GetDatum(idx);
 	worker.bgw_notify_pid		= MyProcPid;
 
@@ -1075,10 +1078,13 @@ update_indexes(Relation rel, HeapTuple tuple)
 	TupleDesc			tupdesc = rel->rd_att;
 
 	result_rel = makeNode(ResultRelInfo);
-	InitResultRelInfo(result_rel,
-					  rel,
-					  1,
-					  0);
+
+#if PG_VERSION_NUM < 100000
+	InitResultRelInfo(result_rel, rel, 1, 0);
+#else
+	InitResultRelInfo(result_rel, rel, 1, NULL, 0);
+#endif
+
 	ExecOpenIndices(result_rel, false);
 
 	if (result_rel->ri_NumIndices > 0 && !HeapTupleIsHeapOnly(tuple))
