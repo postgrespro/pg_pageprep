@@ -612,90 +612,102 @@ worker_main(Datum arg)
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
 	//pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
-	/* Establish signal handlers before unblocking signals */
-	pqsignal(SIGTERM, handle_sigterm);
-
-	/* We're now ready to receive signals */
-	BackgroundWorkerUnblockSignals();
-
-	/* Create resource owner */
-	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
-
-	/* Establish connection and start transaction */
-	BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
-										 pg_pageprep_role);
-
-	/* Iterate through relations */
-	while (true)
+	PG_TRY();
 	{
-		bool	success;
-		Oid		relid;
-		bool	interrupted;
+		/* Establish signal handlers before unblocking signals */
+		pqsignal(SIGTERM, handle_sigterm);
 
-		CHECK_FOR_INTERRUPTS();
+		/* We're now ready to receive signals */
+		BackgroundWorkerUnblockSignals();
 
-		/* User sent stop signal */
-		/* TODO: use atomics here */
-		if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+		/* Create resource owner */
+		CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
+
+		/* Establish connection and start transaction */
+		BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
+											 pg_pageprep_role);
+
+		/* Iterate through relations */
+		while (true)
 		{
-			/*
-			 * TODO: Set latch or something instead and wait until user decides
-			 * to resume this worker
-			 */
-			break;
-		}
+			bool	success;
+			Oid		relid;
+			bool	interrupted;
 
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
+			CHECK_FOR_INTERRUPTS();
 
-		relid = get_next_relation();
-		if (!OidIsValid(relid))
-		{
+			/* User sent stop signal */
+			/* TODO: use atomics here */
+			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+			{
+				/*
+				 * TODO: Set latch or something instead and wait until user decides
+				 * to resume this worker
+				 */
+				break;
+			}
+
+			StartTransactionCommand();
+			PushActiveSnapshot(GetTransactionSnapshot());
+
+			relid = get_next_relation();
+			if (!OidIsValid(relid))
+			{
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
+				continue;
+			}
+			else
+			{
+				update_fillfactor(relid);
+				before_scan(relid);
+			}
+
+			/* Commit current transaction to apply fillfactor changes */
 			PopActiveSnapshot();
 			CommitTransactionCommand();
-			pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
-			continue;
-		}
-		else
-		{
-			update_fillfactor(relid);
-			before_scan(relid);
-		}
 
-		/* Commit current transaction to apply fillfactor changes */
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-
-		/*
-		 * Start a new transaction. It is possible that relation has been
-		 * dropped by someone else by now. It's not a big deal,
-		 * scan_pages_internal will just skip it.
-		 */
-		StartTransactionCommand();
-		PushActiveSnapshot(GetTransactionSnapshot());
-
-		success = scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
-
-		/* TODO: Rollback if not successful? */
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-
-		if (interrupted)
-			break;
-
-		if (!success & !interrupted)
-		{
+			/*
+			 * Start a new transaction. It is possible that relation has been
+			 * dropped by someone else by now. It's not a big deal,
+			 * scan_pages_internal will just skip it.
+			 */
 			StartTransactionCommand();
-			update_status(relid, TS_FAILED);
-			CommitTransactionCommand();
-		}
+			PushActiveSnapshot(GetTransactionSnapshot());
 
-		pg_usleep(pg_pageprep_per_relation_delay * 1000L);
+			success = scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
+
+			/* TODO: Rollback if not successful? */
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+
+			if (interrupted)
+				break;
+
+			if (!success & !interrupted)
+			{
+				StartTransactionCommand();
+				update_status(relid, TS_FAILED);
+				CommitTransactionCommand();
+			}
+
+			pg_usleep(pg_pageprep_per_relation_delay * 1000L);
+		}
 	}
+	PG_CATCH();
+	{
+		worker_data[MyWorkerIndex].status = WS_STOPPED;
+		elog(LOG, "pg_pageprep (%s): error occured",
+			 get_database_name(MyDatabaseId));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
-		elog(LOG, "pg_pageprep: worker has been stopped");
+		elog(LOG, "pg_pageprep (%s): worker has been stopped",
+			 get_database_name(MyDatabaseId));
 		worker_data[MyWorkerIndex].status = WS_STOPPED;
 	}
 }
@@ -718,7 +730,8 @@ get_extension_schema(void)
 	else
 	{
 		if (SPI_exec(EXTENSION_QUERY, 0) != SPI_OK_SELECT)
-			elog(ERROR, "pg_pageprep::get_extension_schema(): failed to execute query");
+			elog(ERROR, "pg_pageprep (%s): failed to execute query (%s)",
+				 get_database_name(MyDatabaseId), EXTENSION_QUERY);
 
 		if (SPI_processed > 0)
 		{
@@ -731,7 +744,7 @@ get_extension_schema(void)
 
 		if (!OidIsValid(res))
 			ereport(ERROR,
-					(errmsg("failed to get pg_pageprep extension schema on '%s' database",
+					(errmsg("pg_pageprep (%s): failed to get pg_pageprep extension schema",
 							get_database_name(MyDatabaseId)),
 					 errhint("perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
 
@@ -1214,4 +1227,3 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 
 	ReleaseTupleDesc(tupdesc);
 }
-
