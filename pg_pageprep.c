@@ -658,11 +658,9 @@ worker_main(Datum arg)
 				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 				continue;
 			}
-			else
-			{
-				update_fillfactor(relid);
-				before_scan(relid);
-			}
+
+			before_scan(relid);
+			update_fillfactor(relid);
 
 			/* Commit current transaction to apply fillfactor changes */
 			PopActiveSnapshot();
@@ -1207,8 +1205,8 @@ update_fillfactor(Oid relid)
 	{
 		query = psprintf("select %s.__update_fillfactor(%u, %u)",
 						 get_namespace_name(get_extension_schema()),
-						 FILLFACTOR,
-						 relid);
+						 relid,
+						 FILLFACTOR);
 
 		SPI_exec(query, 0);
 		SPI_finish();
