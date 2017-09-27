@@ -800,6 +800,7 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 	Oid			relid = DatumGetObjectId(relid_datum);
 	Relation	rel;
 	BlockNumber	blkno;
+	uint32		tuples_moved = 0;
 	bool		success = false;
 
 	*interrupted = false;
@@ -809,7 +810,8 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 		 * Scan heap
 		 */
 		rel = heap_open(relid, AccessShareLock);
-		elog(LOG, "pg_pageprep: scanning pages for %s", RelationGetRelationName(rel));
+		elog(LOG, "pg_pageprep (%s): scanning pages for %s",
+			 get_database_name(MyDatabaseId), RelationGetRelationName(rel));
 
 		for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 		{
@@ -864,7 +866,7 @@ retry:
 						 blkno);
 				}
 				/*
-				 * 
+				 *
 				 */
 				else
 				{
@@ -889,6 +891,7 @@ retry:
 					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
 					{
 						free_space += tuple->t_len;
+						tuples_moved++;
 
 						/*
 						 * One single tuple could be sufficient since tuple
@@ -925,7 +928,12 @@ release_buf:
 	}
 	PG_END_TRY();
 
-	elog(LOG, "pg_pageprep: finish page scan for %s", RelationGetRelationName(rel));
+	elog(LOG,
+		 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
+		 get_database_name(MyDatabaseId),
+		 RelationGetRelationName(rel),
+		 blkno + 1,
+		 tuples_moved);
 	heap_close(rel, AccessShareLock);
 
 	return success;
@@ -996,7 +1004,6 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 		 lp_offset <= lp_count;
 		 lp_offset++, lp++)
 	{
-		/* TODO: Probably we should check DEAD and UNUSED too */
 		/* TODO: Use HeapTupleSatisfiesVacuum() to detect dead tuples */
 		if (ItemIdIsNormal(lp))
 		{
@@ -1014,7 +1021,6 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 			HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
 
 			tuple_copy = heap_copytuple(&tuple);
-			print_tuple(rel->rd_att, &tuple);
 
 			/*
 			 * Xmax is valid but isn't commited. We should figure out was the
@@ -1053,6 +1059,7 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 	HeapUpdateFailureData hufd;
 	LockTupleMode lockmode;
 
+	print_tuple(rel->rd_att, tuple);
 	result = heap_update(rel, lp, tuple,
 						 GetCurrentCommandId(true), InvalidSnapshot,
 						 true /* wait for commit */ ,
