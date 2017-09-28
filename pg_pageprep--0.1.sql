@@ -12,6 +12,24 @@ create table pg_pageprep_jobs (
 );
 create unique index pg_pageprep_data_idx on pg_pageprep_jobs (rel);
 
+create or replace function pg_pageprep_event_trigger()
+returns event_trigger as
+$$
+begin
+    delete from pg_pageprep_jobs
+    where rel in (
+        select objid
+        from pg_event_trigger_dropped_objects()
+        where classid = 'pg_class'::regclass
+    );
+end
+$$
+language plpgsql;
+
+create event trigger
+pg_pageprep_event_trigger
+on sql_drop
+execute procedure pg_pageprep_event_trigger();
 
 create or replace function scan_pages(
 	rel			regclass,
