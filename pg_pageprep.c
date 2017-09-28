@@ -79,6 +79,7 @@ typedef enum
 typedef struct
 {
 	WorkerStatus status;
+	pid_t	pid;
 	char	dbname[64];
 	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
 } Worker;
@@ -138,7 +139,7 @@ static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, s
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
-static void before_scan(Oid relid);
+static void before_scan(Relation rel);
 static void update_fillfactor(Oid relid);
 
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
@@ -368,12 +369,11 @@ get_workers_list(PG_FUNCTION_ARGS)
 		userctx->cur_idx = 0;
 
 		/* Create tuple descriptor */
-		tupdesc = CreateTemplateTupleDesc(2, false);
+		tupdesc = CreateTemplateTupleDesc(3, false);
 
-		TupleDescInitEntry(tupdesc, 1,
-						   "database", TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, 2,
-						   "status", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 1, "pid", INT4OID, -1, 0);
+		TupleDescInitEntry(tupdesc, 2, "database", TEXTOID, -1, 0);
+		TupleDescInitEntry(tupdesc, 3, "status", TEXTOID, -1, 0);
 
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 		funcctx->user_fctx = (void *) userctx;
@@ -391,23 +391,24 @@ get_workers_list(PG_FUNCTION_ARGS)
 
 		if (worker_data[i].status != WS_STOPPED)
 		{
-			Datum		values[2];
-			bool		isnull[2] = { 0 };
+			Datum		values[3];
+			bool		isnull[3] = { 0 };
 
-			values[0] = PointerGetDatum(cstring_to_text(worker_data[i].dbname));
+			values[0] = Int32GetDatum(worker_data[i].pid);
+			values[1] = PointerGetDatum(cstring_to_text(worker_data[i].dbname));
 			switch(worker_data[i].status)
 			{
 				case WS_ACTIVE:
-					values[1] = PointerGetDatum(cstring_to_text("active"));
+					values[2] = PointerGetDatum(cstring_to_text("active"));
 					break;
 				case WS_STOPPING:
-					values[1] = PointerGetDatum(cstring_to_text("stopping"));
+					values[2] = PointerGetDatum(cstring_to_text("stopping"));
 					break;
 				case WS_STARTING:
-					values[1] = PointerGetDatum(cstring_to_text("starting"));
+					values[2] = PointerGetDatum(cstring_to_text("starting"));
 					break;
 				default:
-					values[1] = PointerGetDatum(cstring_to_text("[unknown]"));
+					values[2] = PointerGetDatum(cstring_to_text("[unknown]"));
 			}
 
 			/* Form output tuple */
@@ -609,6 +610,7 @@ worker_main(Datum arg)
 		return;
 	}
 
+	worker_data[MyWorkerIndex].pid = MyProcPid;
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
 	//pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
@@ -630,9 +632,10 @@ worker_main(Datum arg)
 		/* Iterate through relations */
 		while (true)
 		{
-			bool	success;
-			Oid		relid;
-			bool	interrupted;
+			Oid			relid;
+			Relation 	rel;
+			bool		success;
+			bool		interrupted;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -659,8 +662,11 @@ worker_main(Datum arg)
 				continue;
 			}
 
-			before_scan(relid);
-			update_fillfactor(relid);
+			rel = heap_open(relid, AccessShareLock);
+			before_scan(rel);
+			if (RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR) > FILLFACTOR)
+				update_fillfactor(relid);
+			heap_close(rel, AccessShareLock);
 
 			/* Commit current transaction to apply fillfactor changes */
 			PopActiveSnapshot();
@@ -678,7 +684,10 @@ worker_main(Datum arg)
 
 			/* TODO: Rollback if not successful? */
 			PopActiveSnapshot();
-			CommitTransactionCommand();
+			if (success)
+				CommitTransactionCommand();
+			else
+				AbortCurrentTransaction();
 
 			if (interrupted)
 				break;
@@ -905,8 +914,8 @@ retry:
 					goto release_buf;
 				}
 			}
-
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			else
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 release_buf:
 			ReleaseBuffer(buf);
 			pg_usleep(pg_pageprep_per_page_delay * 1000L);
@@ -1166,17 +1175,15 @@ update_status(Oid relid, TaskStatus status)
 }
 
 static void
-before_scan(Oid relid)
+before_scan(Relation rel)
 {
 	Datum	values[2];
 	Oid		types[2] = {OIDOID, INT4OID};
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
-		Relation rel;
 		char *query;
 
-		rel = heap_open(relid, AccessShareLock);
 		query = psprintf("SELECT %s.__add_job($1, $2)",
 						 get_namespace_name(get_extension_schema()));
 
@@ -1188,7 +1195,6 @@ before_scan(Oid relid)
 							  2, types, values, NULL,
 							  false, 0);
 		pfree(query);
-		heap_close(rel, AccessShareLock);
 		SPI_finish();
 	}
 }

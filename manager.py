@@ -88,7 +88,7 @@ def restore(databases):
     for db in databases:
         con = utils.DbConnector(db, args.role)
         if extension_exists(con):
-            con.exec_query("select __restore_fillfactors()")
+            con.exec_query("select restore_fillfactors()")
 
 
 funcs = {

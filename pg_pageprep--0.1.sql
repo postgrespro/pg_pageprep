@@ -32,7 +32,7 @@ language c strict;
 
 
 create or replace function get_workers_list()
-returns table (database text, status text)
+returns table (pid integer, database text, status text)
 as 'MODULE_PATHNAME', 'get_workers_list'
 language c strict;
 
@@ -102,7 +102,7 @@ $$
 language plpgsql;
 
 
-create or replace function __restore_fillfactors()
+create or replace function restore_fillfactors()
 returns void as
 $$
 declare
@@ -110,7 +110,7 @@ declare
 begin
 	for row in (select * from pg_pageprep_jobs)
 	loop
-		select __update_fillfactor(row.rel, row.fillfactor);
+		perform __update_fillfactor(row.rel, row.fillfactor);
 	end loop;
 end	
 $$
