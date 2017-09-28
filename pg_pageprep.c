@@ -75,6 +75,7 @@ typedef enum
 	WS_STOPPING,
 	WS_STARTING,
 	WS_ACTIVE,
+	WS_IDLE
 } WorkerStatus;
 
 typedef struct
@@ -307,6 +308,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 				elog(ERROR, "pg_pageprep: the worker for '%s' database is being started",
 					 worker_data[idx].dbname);
 			case WS_ACTIVE:
+			case WS_IDLE:
 				elog(ERROR, "pg_pageprep: the worker for '%s' database is already started",
 					 worker_data[idx].dbname);
 			default:
@@ -333,6 +335,7 @@ stop_bgworker(PG_FUNCTION_ARGS)
 		case WS_STOPPING:
 			elog(ERROR, "pg_pageprep: the worker is being stopped");
 		case WS_ACTIVE:
+		case WS_IDLE:
 			elog(NOTICE, "pg_pageprep: stop signal has been sent");
 			worker_data[idx].status = WS_STOPPING;
 			break;
@@ -401,6 +404,9 @@ get_workers_list(PG_FUNCTION_ARGS)
 			{
 				case WS_ACTIVE:
 					values[2] = PointerGetDatum(cstring_to_text("active"));
+					break;
+				case WS_IDLE:
+					values[2] = PointerGetDatum(cstring_to_text("idle"));
 					break;
 				case WS_STOPPING:
 					values[2] = PointerGetDatum(cstring_to_text("stopping"));
@@ -653,6 +659,7 @@ worker_main(Datum arg)
 				worker_data[MyWorkerIndex].status = WS_STOPPED;
 				break;
 			}
+			worker_data[MyWorkerIndex].status = WS_ACTIVE;
 
 			StartTransactionCommand();
 			PushActiveSnapshot(GetTransactionSnapshot());
@@ -662,6 +669,7 @@ worker_main(Datum arg)
 			{
 				PopActiveSnapshot();
 				CommitTransactionCommand();
+				worker_data[MyWorkerIndex].status = WS_IDLE;
 				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 				continue;
 			}
