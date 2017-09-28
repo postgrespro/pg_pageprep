@@ -31,6 +31,7 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #if PG_VERSION_NUM >= 100000
 #include "utils/varlena.h"
 #endif
@@ -141,7 +142,7 @@ static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
 static void before_scan(Relation rel);
 static void update_fillfactor(Oid relid);
-
+static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
 
@@ -814,7 +815,8 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 		 */
 		rel = heap_open(relid, AccessShareLock);
 		elog(LOG, "pg_pageprep (%s): scanning pages for %s",
-			 get_database_name(MyDatabaseId), RelationGetRelationName(rel));
+			 get_database_name(MyDatabaseId),
+			 generate_qualified_relation_name(relid));
 
 		for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 		{
@@ -865,7 +867,7 @@ retry:
 				{
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 					elog(NOTICE, "pg_pageprep: %s blkno=%u: can free some space",
-						 RelationGetRelationName(rel),
+						 generate_qualified_relation_name(relid),
 						 blkno);
 				}
 				/*
@@ -887,7 +889,7 @@ retry:
 					 */
 					if (!tuple)
 						elog(ERROR, "pg_pageprep: %s blkno=%u: cannot free any space",
-							 RelationGetRelationName(rel),
+							 generate_qualified_relation_name(relid),
 							 blkno);
 
 					new_tuple = heap_copytuple(tuple);
@@ -934,7 +936,7 @@ release_buf:
 	elog(LOG,
 		 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
 		 get_database_name(MyDatabaseId),
-		 RelationGetRelationName(rel),
+		 generate_qualified_relation_name(relid),
 		 blkno + 1,
 		 tuples_moved);
 	heap_close(rel, AccessShareLock);
@@ -1218,6 +1220,36 @@ update_fillfactor(Oid relid)
 	}
 	else
 		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
+}
+
+/*
+ * from ruleutils.c
+ */
+static char *
+generate_qualified_relation_name(Oid relid)
+{
+	HeapTuple	tp;
+	Form_pg_class reltup;
+	char	   *relname;
+	char	   *nspname;
+	char	   *result;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	reltup = (Form_pg_class) GETSTRUCT(tp);
+	relname = NameStr(reltup->relname);
+
+	nspname = get_namespace_name(reltup->relnamespace);
+	if (!nspname)
+		elog(ERROR, "cache lookup failed for namespace %u",
+			 reltup->relnamespace);
+
+	result = quote_qualified_identifier(nspname, relname);
+
+	ReleaseSysCache(tp);
+
+	return result;
 }
 
 static void

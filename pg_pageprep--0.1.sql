@@ -42,7 +42,8 @@ create view pg_pageprep_todo as (
 	from pg_class c
 	left join @extschema@.pg_pageprep_jobs p on p.rel = c.oid
 	where
-		relkind in ('r', 't') and
+		relkind in ('r', 't', 'm') and
+		relpersistence != 't' and
 		c.oid >= 16384 and
 		(status IS NULL OR status != 'done')
 );
