@@ -647,6 +647,9 @@ worker_main(Datum arg)
 				 * TODO: Set latch or something instead and wait until user decides
 				 * to resume this worker
 				 */
+				elog(LOG, "pg_pageprep: worker has been stopped (pid: %u)",
+					 MyProcPid);
+				worker_data[MyWorkerIndex].status = WS_STOPPED;
 				break;
 			}
 
@@ -710,13 +713,6 @@ worker_main(Datum arg)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-
-	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
-	{
-		elog(LOG, "pg_pageprep (%s): worker has been stopped",
-			 get_database_name(MyDatabaseId));
-		worker_data[MyWorkerIndex].status = WS_STOPPED;
-	}
 }
 
 /*
