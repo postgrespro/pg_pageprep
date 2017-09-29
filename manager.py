@@ -45,7 +45,7 @@ def show_workers_list(con):
     workers_list = [x.strip() for x in res.split()]
     if (workers_list):
         for worker in workers_list:
-            dbname, status = worker.split(",")
+            pid, dbname, status = worker.split(",")
             print("\t{}: {}".format(dbname, status))
     else:
         print("\tThere are no active pg_pageprep's workers")
