@@ -127,7 +127,9 @@ $$
 declare
 	row record;
 begin
-	for row in (select * from pg_pageprep_jobs)
+	for row in (select rel, fillfactor
+				from pg_pageprep_jobs p
+				join pg_class c on c.oid = p.rel and c.relkind != 't')
 	loop
 		perform __update_fillfactor(row.rel, row.fillfactor);
 	end loop;
