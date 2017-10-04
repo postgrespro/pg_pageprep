@@ -977,6 +977,7 @@ finish:
 			 get_database_name(MyDatabaseId),
 		 	 generate_qualified_relation_name(relid),
 		 	 blkno);
+		CommitTransactionCommand();
 	}
 	PG_END_TRY();
 
