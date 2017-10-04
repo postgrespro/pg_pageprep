@@ -80,7 +80,7 @@ typedef enum
 
 typedef struct
 {
-	WorkerStatus status;
+	volatile WorkerStatus status;
 	pid_t	pid;
 	char	dbname[64];
 	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
@@ -503,7 +503,7 @@ starter_process_main(Datum dummy)
 				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
 				HeapTuple	tuple = SPI_tuptable->vals[i];
 				char	   *dbname;
-				
+
 				dbname = SPI_getvalue(tuple, tupdesc, 1);
 				if (strcmp(dbname, "template0") == 0)
 					continue;
@@ -526,15 +526,16 @@ start_bgworker_dynamic(const char *dbname)
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t		pid;
 	int			idx;
+	char		buf[64];
 
 	if (!dbname)
 		dbname = get_database_name(MyDatabaseId);
 	idx = acquire_slot(dbname);
 
 	/* Initialize worker struct */
+	memcpy(buf, dbname, sizeof(buf));
 	snprintf(worker.bgw_name, BGW_MAXLEN,
-			 "pg_pageprep (%s)",
-			 worker_data[idx].dbname);
+			 "pg_pageprep (%s)", buf);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
 	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
 
@@ -608,8 +609,10 @@ find_database_slot(const char *dbname)
 void
 worker_main(Datum arg)
 {
-	elog(LOG, "pg_pageprep: worker is started (pid: %u)", MyProcPid);
 	MyWorkerIndex = DatumGetInt32(arg);
+
+	elog(LOG, "pg_pageprep: worker is started (pid: %u) for \"%s\" database",
+			MyProcPid, worker_data[MyWorkerIndex].dbname);
 
 	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 	{
@@ -647,7 +650,6 @@ worker_main(Datum arg)
 			CHECK_FOR_INTERRUPTS();
 
 			/* User sent stop signal */
-			/* TODO: use atomics here */
 			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 			{
 				/*
@@ -663,6 +665,18 @@ worker_main(Datum arg)
 
 			StartTransactionCommand();
 			PushActiveSnapshot(GetTransactionSnapshot());
+
+			if (SPI_connect() == SPI_OK_CONNECT)
+			{
+				Oid schema = get_extension_schema();
+				if (!OidIsValid(schema))
+					elog(ERROR, "extension is not installed in \"%s\" database",
+							worker_data[MyWorkerIndex].dbname);
+
+				worker_data[MyWorkerIndex].ext_schema = schema;
+				SPI_finish();
+			}
+			else elog(ERROR, "SPI initialization error");
 
 			relid = get_next_relation();
 			if (!OidIsValid(relid))
@@ -753,14 +767,6 @@ get_extension_schema(void)
 
 			res = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
 		}
-
-		if (!OidIsValid(res))
-			ereport(ERROR,
-					(errmsg("pg_pageprep (%s): failed to get pg_pageprep extension schema",
-							get_database_name(MyDatabaseId)),
-					 errhint("perform 'CREATE EXTENSION pg_pageprep' on each database and restart cluster")));
-
-		worker_data[MyWorkerIndex].ext_schema = res;
 	}
 
 	return res;
@@ -774,9 +780,9 @@ get_next_relation(void)
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
 		char *query;
+		char *namespace = get_namespace_name(get_extension_schema());
 
-		query = psprintf("SELECT * FROM %s.pg_pageprep_todo",
-						 get_namespace_name(get_extension_schema()));
+		query = psprintf("SELECT * FROM %s.pg_pageprep_todo", namespace);
 
 		if (SPI_exec(query, 0) != SPI_OK_SELECT)
 			elog(ERROR, "pg_pageprep::get_next_relation() failed");
