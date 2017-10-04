@@ -2,3 +2,6 @@
 *.so
 *.o
 *.pyc
+/results
+regression.diffs
+regression.out
