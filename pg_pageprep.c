@@ -622,7 +622,7 @@ worker_main(Datum arg)
 
 	worker_data[MyWorkerIndex].pid = MyProcPid;
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
-	//pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
+	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	PG_TRY();
 	{
@@ -692,6 +692,10 @@ worker_main(Datum arg)
 			before_scan(rel);
 			if (RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR) > FILLFACTOR)
 				update_fillfactor(relid);
+
+			elog(LOG, "pg_pageprep (%s): scanning pages for %s",
+				 get_database_name(MyDatabaseId),
+				 generate_qualified_relation_name(relid));
 			heap_close(rel, AccessShareLock);
 
 			/* Commit current transaction to apply fillfactor changes */
@@ -699,26 +703,14 @@ worker_main(Datum arg)
 			CommitTransactionCommand();
 
 			/*
-			 * Start a new transaction. It is possible that relation has been
-			 * dropped by someone else by now. It's not a big deal,
-			 * scan_pages_internal will just skip it.
+			 * Scan relation
 			 */
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
-
 			success = scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
-
-			/* TODO: Rollback if not successful? */
-			PopActiveSnapshot();
-			if (success)
-				CommitTransactionCommand();
-			else
-				AbortCurrentTransaction();
 
 			if (interrupted)
 				break;
 
-			if (!success & !interrupted)
+			if (!success && !interrupted)
 			{
 				StartTransactionCommand();
 				update_status(relid, TS_FAILED);
@@ -730,9 +722,11 @@ worker_main(Datum arg)
 	}
 	PG_CATCH();
 	{
+		StartTransactionCommand();
 		worker_data[MyWorkerIndex].status = WS_STOPPED;
 		elog(LOG, "pg_pageprep (%s): error occured",
 			 get_database_name(MyDatabaseId));
+		CommitTransactionCommand();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -817,8 +811,9 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 {
 	Oid			relid = DatumGetObjectId(relid_datum);
 	Relation	rel;
-	BlockNumber	blkno;
+	BlockNumber	blkno = 0;
 	uint32		tuples_moved = 0;
+	bool		new_transaction_needed = true;
 	bool		success = false;
 
 	*interrupted = false;
@@ -827,17 +822,20 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 		/*
 		 * Scan heap
 		 */
-		rel = heap_open(relid, AccessShareLock);
-		elog(LOG, "pg_pageprep (%s): scanning pages for %s",
-			 get_database_name(MyDatabaseId),
-			 generate_qualified_relation_name(relid));
-
-		for (blkno = 0; blkno < RelationGetNumberOfBlocks(rel); blkno++)
+		while (true)
 		{
 			Buffer		buf;
 			Page		page;
 			PageHeader	header;
 			size_t		free_space;
+
+			if (new_transaction_needed)
+			{
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+				rel = heap_open(relid, RowExclusiveLock);
+				new_transaction_needed = false;
+			}
 
 retry:
 			CHECK_FOR_INTERRUPTS();
@@ -845,14 +843,17 @@ retry:
 			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 			{
 				*interrupted = true;
-				break;
+				goto finish;
 			}
+
+			if (blkno >= RelationGetNumberOfBlocks(rel))
+				goto finish;
 
 			buf = ReadBuffer(rel, blkno);
 
 			/* Skip invalid buffers */
 			if (!BufferIsValid(buf))
-				continue;
+				goto release_buf;
 
 			/* TODO: Lock page */
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -894,6 +895,7 @@ retry:
 					OffsetNumber	offnum = FirstOffsetNumber;
 
 					tuple = get_next_tuple(rel, buf, blkno, offnum);
+
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 					/*
@@ -906,7 +908,9 @@ retry:
 							 generate_qualified_relation_name(relid),
 							 blkno);
 
+					new_transaction_needed = true;
 					new_tuple = heap_copytuple(tuple);
+					elog(LOG, "blkno: %u", blkno);
 					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
 					{
 						free_space += tuple->t_len;
@@ -923,6 +927,7 @@ retry:
 							goto retry;
 						}
 					}
+					/* TODO: is it needed here? */
 					goto release_buf;
 				}
 			}
@@ -930,30 +935,51 @@ retry:
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 release_buf:
 			ReleaseBuffer(buf);
-			pg_usleep(pg_pageprep_per_page_delay * 1000L);
-		}
+			blkno++;
 
-		if (*interrupted)
-			update_status(relid, TS_INTERRUPTED);
-		else
-		{
-			update_status(relid, TS_DONE);
-			success = true;
+			if (new_transaction_needed)
+			{
+				heap_close(rel, RowExclusiveLock);
+				PopActiveSnapshot();
+				CommitTransactionCommand();
+			}
+
+			pg_usleep(pg_pageprep_per_page_delay * 1000L);
+			continue;
+
+finish:
+			if (*interrupted)
+				update_status(relid, TS_INTERRUPTED);
+			else
+			{
+				update_status(relid, TS_DONE);
+				success = true;
+			}
+
+			elog(LOG,
+				 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
+				 get_database_name(MyDatabaseId),
+				 generate_qualified_relation_name(relid),
+				 blkno + 1,
+				 tuples_moved);
+
+			heap_close(rel, RowExclusiveLock);
+			PopActiveSnapshot();
+			CommitTransactionCommand();
+			break;
 		}
 	}
 	PG_CATCH();
 	{
 		success = false;
+		StartTransactionCommand();
+		elog(LOG, "pg_pageprep (%s): error occured while scanning %s (blkno: %u)",
+			 get_database_name(MyDatabaseId),
+		 	 generate_qualified_relation_name(relid),
+		 	 blkno);
+		CommitTransactionCommand();
 	}
 	PG_END_TRY();
-
-	elog(LOG,
-		 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
-		 get_database_name(MyDatabaseId),
-		 generate_qualified_relation_name(relid),
-		 blkno + 1,
-		 tuples_moved);
-	heap_close(rel, AccessShareLock);
 
 	return success;
 }
@@ -989,12 +1015,15 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_
 			ItemPointerSet(&(heaptup.t_self), blkno, lp_offset);
 
 			/* Can we remove this tuple? */
-			if (HeapTupleSatisfiesVacuum(&heaptup, xid, buf) == HEAPTUPLE_DEAD)
+			switch (HeapTupleSatisfiesVacuum(&heaptup, xid, buf))
 			{
-				*free_space += ItemIdGetLength(lp);
-
-				if (*free_space >= NEEDED_SPACE_SIZE)
-					return true;
+				case HEAPTUPLE_DEAD:
+				case HEAPTUPLE_RECENTLY_DEAD:
+					*free_space += ItemIdGetLength(lp);
+					if (*free_space >= NEEDED_SPACE_SIZE)
+						return true;
+				default:
+					break; /* don't care for other statuses */
 			}
 		}
 	}
@@ -1026,10 +1055,9 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 		/* TODO: Use HeapTupleSatisfiesVacuum() to detect dead tuples */
 		if (ItemIdIsNormal(lp))
 		{
-			HeapTupleHeader	tuphead = (HeapTupleHeader) PageGetItem(page, lp);
-			TransactionId	xmax = HeapTupleHeaderGetRawXmax_compat(page, tuphead);
 			HeapTupleData	tuple;
 			HeapTuple		tuple_copy;
+			HTSU_Result		res;
 
 			/* Build in-memory tuple representation */
 			tuple.t_tableOid = RelationGetRelid(rel);
@@ -1037,26 +1065,15 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 			tuple.t_len = ItemIdGetLength(lp);
 			ItemPointerSet(&(tuple.t_self), blkno, lp_offset);
 
-			HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
+			// HeapTupleSatisfiesMVCC(&tuple, GetActiveSnapshot(), buf);
+
+			res = HeapTupleSatisfiesUpdate(&tuple,
+										   GetCurrentCommandId(true),
+										   buf);
+			if (res != HeapTupleMayBeUpdated)
+				continue;
 
 			tuple_copy = heap_copytuple(&tuple);
-
-			/*
-			 * Xmax is valid but isn't commited. We should figure out was the
-			 * transaction aborted or is it still going on
-			 */
-			if (TransactionIdIsValid(xmax)
-				&& (tuphead->t_infomask & ~HEAP_XMAX_COMMITTED))
-			{
-				if (TransactionIdIsInProgress(xmax))
-					continue;
-			}
-
-			if (!HeapTupleHeaderXminCommitted(tuphead))
-				if (HeapTupleHeaderXminInvalid(tuphead))
-					/* Tuple is invisible, skip it */
-					continue;
-
 			return tuple_copy;
 		}
 	}
