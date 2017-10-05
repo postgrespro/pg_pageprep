@@ -32,8 +32,7 @@ on sql_drop
 execute procedure pg_pageprep_event_trigger();
 
 create or replace function scan_pages(
-	rel			regclass,
-	bgworker	boolean default false
+	rel			regclass
 )
 returns void as 'MODULE_PATHNAME', 'scan_pages'
 language c strict;

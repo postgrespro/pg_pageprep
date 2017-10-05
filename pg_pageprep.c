@@ -90,10 +90,12 @@ static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
 static char *pg_pageprep_database = NULL;
+static bool pg_pageprep_enable_workers = true;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
 int MyWorkerIndex = 0;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static bool xact_started = false;
 
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
@@ -136,13 +138,15 @@ void worker_main(Datum arg);
 static Oid get_extension_schema(void);
 static Oid get_next_relation(void);
 static bool scan_pages_internal(Datum relid_datum, bool *interrupted);
-static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset);
-static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_space);
+static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno,
+		OffsetNumber *start_offset);
+static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
+		size_t *free_space);
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
 static void before_scan(Relation rel);
-static void update_fillfactor(Oid relid);
+static void update_fillfactor(Relation);
 static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
@@ -164,10 +168,10 @@ _PG_init(void)
 
 	setup_guc_variables();
 
-    if (!process_shared_preload_libraries_in_progress)
-        return;
-
-    start_starter_process();
+	if (pg_pageprep_enable_workers)
+		start_starter_process();
+	else
+		elog(LOG, "pg_pageprep: workers are disabled");
 }
 
 static void
@@ -234,6 +238,17 @@ setup_guc_variables(void)
                             NULL,
                             NULL,	/* TODO: disallow to change it in runtime */
                             NULL);
+
+	DefineCustomBoolVariable("pg_pageprep.enable_workers",
+							 "Enable workers of pg_pageprep",
+							 NULL,
+							 &pg_pageprep_enable_workers,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
 }
 
 static void
@@ -279,11 +294,48 @@ handle_sigterm(SIGNAL_ARGS)
 	errno = save_errno;
 }
 
+static void
+start_xact_command(void)
+{
+	if (IsTransactionState())
+		return;
+
+	if (!xact_started)
+	{
+		ereport(DEBUG3,
+				(errmsg_internal("StartTransactionCommand")));
+		StartTransactionCommand();
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		xact_started = true;
+	}
+}
+
+static void
+finish_xact_command(void)
+{
+	if (xact_started)
+	{
+		/* Now commit the command */
+		ereport(DEBUG3,
+				(errmsg_internal("CommitTransactionCommand")));
+
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		xact_started = false;
+	}
+}
+
 Datum
 scan_pages(PG_FUNCTION_ARGS)
 {
-	Oid		relid = PG_GETARG_OID(0);
-	bool	interrupted;
+	Relation	rel;
+	Oid			relid = PG_GETARG_OID(0);
+	bool		interrupted;
+
+	rel = heap_open(relid, NoLock);
+	update_fillfactor(rel);
+	heap_close(rel, NoLock);
 
 	scan_pages_internal(relid, &interrupted);
 	PG_RETURN_VOID();
@@ -486,8 +538,7 @@ starter_process_main(Datum dummy)
 	BackgroundWorkerInitializeConnection(pg_pageprep_database,
 										 pg_pageprep_role);
 
-	StartTransactionCommand();
-	PushActiveSnapshot(GetTransactionSnapshot());
+	start_xact_command();
 
 	if (SPI_connect() == SPI_OK_CONNECT)
 	{
@@ -514,9 +565,7 @@ starter_process_main(Datum dummy)
 	}
 
 	SPI_finish();
-
-	PopActiveSnapshot();
-	CommitTransactionCommand();
+	finish_xact_command();
 }
 
 static void
@@ -663,8 +712,7 @@ worker_main(Datum arg)
 			}
 			worker_data[MyWorkerIndex].status = WS_ACTIVE;
 
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
+			start_xact_command();
 
 			if (SPI_connect() == SPI_OK_CONNECT)
 			{
@@ -681,8 +729,7 @@ worker_main(Datum arg)
 			relid = get_next_relation();
 			if (!OidIsValid(relid))
 			{
-				PopActiveSnapshot();
-				CommitTransactionCommand();
+				finish_xact_command();
 				worker_data[MyWorkerIndex].status = WS_IDLE;
 				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 				continue;
@@ -690,8 +737,7 @@ worker_main(Datum arg)
 
 			rel = heap_open(relid, AccessShareLock);
 			before_scan(rel);
-			if (RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR) > FILLFACTOR)
-				update_fillfactor(relid);
+			update_fillfactor(rel);
 
 			elog(LOG, "pg_pageprep (%s): scanning pages for %s",
 				 get_database_name(MyDatabaseId),
@@ -699,8 +745,7 @@ worker_main(Datum arg)
 			heap_close(rel, AccessShareLock);
 
 			/* Commit current transaction to apply fillfactor changes */
-			PopActiveSnapshot();
-			CommitTransactionCommand();
+			finish_xact_command();
 
 			/*
 			 * Scan relation
@@ -712,9 +757,9 @@ worker_main(Datum arg)
 
 			if (!success && !interrupted)
 			{
-				StartTransactionCommand();
+				start_xact_command();
 				update_status(relid, TS_FAILED);
-				CommitTransactionCommand();
+				finish_xact_command();
 			}
 
 			pg_usleep(pg_pageprep_per_relation_delay * 1000L);
@@ -722,11 +767,9 @@ worker_main(Datum arg)
 	}
 	PG_CATCH();
 	{
-		StartTransactionCommand();
 		worker_data[MyWorkerIndex].status = WS_STOPPED;
 		elog(LOG, "pg_pageprep (%s): error occured",
-			 get_database_name(MyDatabaseId));
-		CommitTransactionCommand();
+				worker_data[MyWorkerIndex].dbname);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -813,7 +856,7 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 	Relation	rel;
 	BlockNumber	blkno = 0;
 	uint32		tuples_moved = 0;
-	bool		new_transaction_needed = true;
+	bool		reopen_relation = true;
 	bool		success = false;
 
 	*interrupted = false;
@@ -829,33 +872,33 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 			PageHeader	header;
 			size_t		free_space;
 
-			if (new_transaction_needed)
+			if (reopen_relation)
 			{
-				StartTransactionCommand();
-				PushActiveSnapshot(GetTransactionSnapshot());
+				finish_xact_command();
+				start_xact_command();
+
 				rel = heap_open(relid, RowExclusiveLock);
-				new_transaction_needed = false;
+				reopen_relation = false;
 			}
 
-retry:
+retry_block:
 			CHECK_FOR_INTERRUPTS();
 
 			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
 			{
 				*interrupted = true;
-				goto finish;
+				break;
 			}
 
 			if (blkno >= RelationGetNumberOfBlocks(rel))
-				goto finish;
+				break;
 
 			buf = ReadBuffer(rel, blkno);
 
 			/* Skip invalid buffers */
 			if (!BufferIsValid(buf))
-				goto release_buf;
+				goto next_block;
 
-			/* TODO: Lock page */
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			header = (PageHeader) page;
@@ -880,8 +923,7 @@ retry:
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
 				{
-					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-					elog(NOTICE, "pg_pageprep: %s blkno=%u: can free some space",
+					elog(NOTICE, "pg_pageprep: %s blkno=%u: all good, enough space after vacuum",
 						 generate_qualified_relation_name(relid),
 						 blkno);
 				}
@@ -894,8 +936,8 @@ retry:
 					HeapTuple		new_tuple;
 					OffsetNumber	offnum = FirstOffsetNumber;
 
-					tuple = get_next_tuple(rel, buf, blkno, offnum);
-
+next_tuple:
+					tuple = get_next_tuple(rel, buf, blkno, &offnum);
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 					/*
@@ -908,9 +950,10 @@ retry:
 							 generate_qualified_relation_name(relid),
 							 blkno);
 
-					new_transaction_needed = true;
+					reopen_relation = true;
 					new_tuple = heap_copytuple(tuple);
 					elog(LOG, "blkno: %u", blkno);
+
 					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
 					{
 						free_space += tuple->t_len;
@@ -918,66 +961,59 @@ retry:
 
 						/*
 						 * One single tuple could be sufficient since tuple
-						 * header alone takes 23 bytes. But if it's not
+						 * header alone takes 24 bytes. But if it's not
 						 * then try again
 						 */
 						if (free_space < NEEDED_SPACE_SIZE)
 						{
 							ReleaseBuffer(buf);
-							goto retry;
+							goto retry_block;
 						}
+
+						goto next_block;
 					}
-					/* TODO: is it needed here? */
-					goto release_buf;
+					LockBuffer(buf, BUFFER_LOCK_SHARE);
+					goto next_tuple;
 				}
 			}
-			else
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-release_buf:
+
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+next_block:
 			ReleaseBuffer(buf);
 			blkno++;
 
-			if (new_transaction_needed)
-			{
+			if (reopen_relation)
 				heap_close(rel, RowExclusiveLock);
-				PopActiveSnapshot();
-				CommitTransactionCommand();
-			}
 
 			pg_usleep(pg_pageprep_per_page_delay * 1000L);
-			continue;
-
-finish:
-			if (*interrupted)
-				update_status(relid, TS_INTERRUPTED);
-			else
-			{
-				update_status(relid, TS_DONE);
-				success = true;
-			}
-
-			elog(LOG,
-				 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
-				 get_database_name(MyDatabaseId),
-				 generate_qualified_relation_name(relid),
-				 blkno + 1,
-				 tuples_moved);
-
-			heap_close(rel, RowExclusiveLock);
-			PopActiveSnapshot();
-			CommitTransactionCommand();
-			break;
 		}
+
+		if (*interrupted)
+			update_status(relid, TS_INTERRUPTED);
+		else
+		{
+			update_status(relid, TS_DONE);
+			success = true;
+		}
+
+		elog(LOG,
+			 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
+			 get_database_name(MyDatabaseId),
+			 generate_qualified_relation_name(relid),
+			 blkno + 1,
+			 tuples_moved);
+
+		heap_close(rel, RowExclusiveLock);
+		finish_xact_command();
 	}
 	PG_CATCH();
 	{
 		success = false;
-		StartTransactionCommand();
 		elog(LOG, "pg_pageprep (%s): error occured while scanning %s (blkno: %u)",
-			 get_database_name(MyDatabaseId),
+			 worker_data[MyWorkerIndex].dbname,
 		 	 generate_qualified_relation_name(relid),
 		 	 blkno);
-		CommitTransactionCommand();
 	}
 	PG_END_TRY();
 
@@ -1038,7 +1074,7 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_
  *		Note: Caller must hold shared lock on the page
  */
 static HeapTuple
-get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_offset)
+get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber *start_offset)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
@@ -1048,9 +1084,9 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber start_o
 	page = BufferGetPage(buf);
 	lp_count = PageGetMaxOffsetNumber(page);
 
-	for (lp_offset = start_offset, lp = PageGetItemId(page, lp_offset);
+	for (lp_offset = *start_offset, lp = PageGetItemId(page, lp_offset);
 		 lp_offset <= lp_count;
-		 lp_offset++, lp++)
+		 lp_offset++, lp++, *start_offset++)
 	{
 		/* TODO: Use HeapTupleSatisfiesVacuum() to detect dead tuples */
 		if (ItemIdIsNormal(lp))
@@ -1106,6 +1142,10 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 		 * Tuple was already updated in current command or updated concurrently
 		 */
 		case HeapTupleSelfUpdated:
+			/* should not happen */
+			elog(ERROR, "trying to update tuple twice");
+
+		case HeapTupleBeingUpdated:
 		case HeapTupleUpdated:
 			ret = false;
 			break;
@@ -1232,25 +1272,30 @@ before_scan(Relation rel)
  * Set new fillfactor
  */
 static void
-update_fillfactor(Oid relid)
+update_fillfactor(Relation relation)
 {
 	char *query;
 
-	if (SPI_connect() == SPI_OK_CONNECT)
+	if (RelationGetFillFactor(relation, HEAP_DEFAULT_FILLFACTOR) > FILLFACTOR)
 	{
-		query = psprintf("select %s.__update_fillfactor(%u, %u)",
-						 get_namespace_name(get_extension_schema()),
-						 relid,
-						 FILLFACTOR);
+		if (SPI_connect() == SPI_OK_CONNECT)
+		{
+			query = psprintf("select %s.__update_fillfactor(%u, %u)",
+							 get_namespace_name(get_extension_schema()),
+							 relation->rd_id,
+							 FILLFACTOR);
 
-		SPI_exec(query, 0);
-		SPI_finish();
+			SPI_exec(query, 0);
+			SPI_finish();
 
-		/* Invalidate relcache */
-		CacheInvalidateRelcacheByRelid(relid);
+			elog(NOTICE, "fillfactor was updated for %d", relation->rd_id);
+
+			/* Invalidate relcache */
+			CacheInvalidateRelcacheByRelid(relation->rd_id);
+		}
+		else
+			elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
 	}
-	else
-		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
 }
 
 /*
