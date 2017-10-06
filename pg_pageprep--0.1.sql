@@ -16,7 +16,7 @@ create or replace function pg_pageprep_event_trigger()
 returns event_trigger as
 $$
 begin
-    delete from pg_pageprep_jobs
+    delete from @extschema@.pg_pageprep_jobs
     where rel in (
         select objid
         from pg_event_trigger_dropped_objects()
@@ -78,8 +78,8 @@ language sql;
 create or replace function __update_status(rel regclass, status text)
 returns void as
 $$
-	update pg_pageprep_jobs
-	set status = $2::pg_pageprep_status
+	update @extschema@.pg_pageprep_jobs
+	set status = $2::@extschema@.pg_pageprep_status
 	where rel = $1;
 $$
 language sql;
@@ -127,7 +127,7 @@ declare
 	row record;
 begin
 	for row in (select rel, fillfactor
-				from pg_pageprep_jobs p
+				from @extschema@.pg_pageprep_jobs p
 				join pg_class c on c.oid = p.rel and c.relkind != 't')
 	loop
 		perform __update_fillfactor(row.rel, row.fillfactor);
