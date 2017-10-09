@@ -1,0 +1,185 @@
+\set verbosity terse
+/* should be off for testing */
+SHOW pg_pageprep.enable_workers;
+ pg_pageprep.enable_workers 
+----------------------------
+ off
+(1 row)
+
+/* minimal delays */
+SET pg_pageprep.per_relation_delay=1;
+SET pg_pageprep.per_page_delay=1;
+CREATE EXTENSION pg_pageprep;
+CREATE VIEW todo_list AS
+	SELECT regexp_replace(relname::text, '\d+'::text, '0') as relname, status
+	FROM pg_pageprep_todo
+	ORDER BY relname;
+CREATE VIEW jobs_list AS
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel, fillfactor, status
+	FROM pg_pageprep_jobs
+	ORDER BY rel;
+CREATE TABLE one(a INT4) WITH (fillfactor=100);
+SELECT * FROM todo_list;
+     relname      | status 
+------------------+--------
+ one              | 
+ pg_pageprep_jobs | 
+(2 rows)
+
+INSERT INTO one SELECT i FROM generate_series(1, 1000) i;
+\d+ one
+                         Table "public.one"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ a      | integer |           | plain   |              | 
+Options: fillfactor=100
+
+SELECT scan_pages('one'::regclass);
+NOTICE:  fillfactor was updated for "public.one"
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 6, tuples moved: 0)
+ scan_pages 
+------------
+ 
+(1 row)
+
+\d+ one
+                         Table "public.one"
+ Column |  Type   | Modifiers | Storage | Stats target | Description 
+--------+---------+-----------+---------+--------------+-------------
+ a      | integer |           | plain   |              | 
+Options: fillfactor=90
+
+SELECT * FROM todo_list;
+     relname      | status 
+------------------+--------
+ pg_pageprep_jobs | 
+(1 row)
+
+SELECT * FROM jobs_list;
+ rel | fillfactor | status 
+-----+------------+--------
+ one |        100 | done
+(1 row)
+
+/* should be zero updated */
+SELECT scan_pages('one'::regclass);
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 6, tuples moved: 0)
+ scan_pages 
+------------
+ 
+(1 row)
+
+DROP TABLE one CASCADE;
+CREATE TABLE two(a tsvector) WITH (fillfactor=100);
+INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
+CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
+SELECT * FROM todo_list;
+     relname      | status 
+------------------+--------
+ pg_pageprep_jobs | 
+ pg_toast_0       | 
+ pg_toast_0       | 
+ two              | 
+ view_two         | 
+(5 rows)
+
+SELECT scan_pages('two'::REGCLASS);
+NOTICE:  fillfactor was updated for "public.two"
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 10, tuples moved: 8)
+ scan_pages 
+------------
+ 
+(1 row)
+
+SELECT scan_pages('view_two'::REGCLASS);
+NOTICE:  fillfactor was updated for "public.view_two"
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 10, tuples moved: 8)
+ scan_pages 
+------------
+ 
+(1 row)
+
+SELECT * FROM todo_list;
+     relname      | status 
+------------------+--------
+ pg_pageprep_jobs | 
+ pg_toast_0       | 
+ pg_toast_0       | 
+(3 rows)
+
+SELECT * FROM jobs_list;
+   rel    | fillfactor | status 
+----------+------------+--------
+ two      |        100 | done
+ view_two |        100 | done
+(2 rows)
+
+/* should be zeros */
+SELECT scan_pages('two'::REGCLASS);
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 10, tuples moved: 0)
+ scan_pages 
+------------
+ 
+(1 row)
+
+SELECT scan_pages('view_two'::REGCLASS);
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 10, tuples moved: 0)
+ scan_pages 
+------------
+ 
+(1 row)
+
+INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
+/* should be still zero */
+SELECT scan_pages('two'::REGCLASS);
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 19, tuples moved: 0)
+ scan_pages 
+------------
+ 
+(1 row)
+
+/* nothing to do */
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+DROP TABLE two CASCADE;
+NOTICE:  drop cascades to materialized view view_two
+CREATE TABLE two(a tsvector) WITH (fillfactor=100);
+INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
+CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
+SELECT * FROM todo_list;
+  relname   | status 
+------------+--------
+ pg_toast_0 | 
+ pg_toast_0 | 
+ two        | 
+ view_two   | 
+(4 rows)
+
+/* should scan 'two' and 'view_two' */
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+SELECT * FROM todo_list;
+ relname | status 
+---------+--------
+(0 rows)
+
+SELECT * FROM jobs_list;
+         rel         | fillfactor | status 
+---------------------+------------+--------
+ pg_pageprep_jobs    |        100 | done
+ pg_toast.pg_toast_0 |        100 | done
+ pg_toast.pg_toast_0 |        100 | done
+ two                 |        100 | done
+ view_two            |        100 | done
+(5 rows)
+
+DROP VIEW todo_list;
+DROP VIEW jobs_list;

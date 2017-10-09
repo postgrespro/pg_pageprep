@@ -1,6 +1,8 @@
+drop type if exists pg_pageprep_status;
 create type pg_pageprep_status as enum (
 	'new',
 	'in progress',
+	'partly done',
 	'interrupted',
 	'failed',
 	'done'

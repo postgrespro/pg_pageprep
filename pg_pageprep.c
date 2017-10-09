@@ -1,3 +1,5 @@
+#include "pg_pageprep.h"
+
 #include "postgres.h"
 #include "fmgr.h"
 #include "funcapi.h"
@@ -24,6 +26,7 @@
 #include "storage/dsm.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -32,6 +35,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+
 #if PG_VERSION_NUM >= 100000
 #include "utils/varlena.h"
 #endif
@@ -51,41 +55,6 @@ PG_MODULE_MAGIC;
  * 3. set fillfactor - done
  */
 
-typedef enum
-{
-	TS_NEW = 0,
-	TS_INPROGRESS,
-	TS_INTERRUPTED,
-	TS_FAILED,
-	TS_DONE
-} TaskStatus;
-
-char *status_map[] = 
-{
-	"new",
-	"in progress",
-	"interrupted",
-	"failed",
-	"done"
-};
-
-typedef enum
-{
-	WS_STOPPED,
-	WS_STOPPING,
-	WS_STARTING,
-	WS_ACTIVE,
-	WS_IDLE
-} WorkerStatus;
-
-typedef struct
-{
-	volatile WorkerStatus status;
-	pid_t	pid;
-	char	dbname[64];
-	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
-} Worker;
-
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
@@ -97,21 +66,20 @@ int MyWorkerIndex = 0;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
 
-
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
 #ifdef PGPRO_EE
 #define HeapTupleHeaderGetRawXmax_compat(page, tup) \
-	HeapTupleHeaderGetRawXmax(page, tup)
+	HeapTupleHeaderGetRawXmax((page), (tup))
 #else
 #define HeapTupleHeaderGetRawXmax_compat(page, tup) \
 	HeapTupleHeaderGetRawXmax(tup)
 #endif
 
 #if PG_VERSION_NUM < 100000
-	#define GetOldestXmin_compat(rel) GetOldestXmin(rel, true)
+	#define GetOldestXmin_compat(rel) GetOldestXmin((rel), true)
 #else
-	#define GetOldestXmin_compat(rel) GetOldestXmin(rel, PROCARRAY_FLAGS_VACUUM)
+	#define GetOldestXmin_compat(rel) GetOldestXmin((rel), PROCARRAY_FLAGS_VACUUM)
 #endif
 
 /*
@@ -131,7 +99,7 @@ static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
 static void start_starter_process(void);
 void starter_process_main(Datum dummy);
-static void start_bgworker_dynamic(const char *dbname);
+static void start_bgworker_dynamic(const char *, Oid, bool);
 static int acquire_slot(const char *dbname);
 static int find_database_slot(const char *dbname);
 void worker_main(Datum arg);
@@ -145,7 +113,7 @@ static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status);
-static void before_scan(Relation rel);
+static void add_relation_to_jobs(Relation rel);
 static void update_fillfactor(Relation);
 static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
@@ -334,6 +302,7 @@ scan_pages(PG_FUNCTION_ARGS)
 	bool		interrupted;
 
 	rel = heap_open(relid, NoLock);
+	add_relation_to_jobs(rel);
 	update_fillfactor(rel);
 	heap_close(rel, NoLock);
 
@@ -368,7 +337,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 		}
 	}
 
-	start_bgworker_dynamic(NULL);
+	start_bgworker_dynamic(NULL, InvalidOid, true);
 	PG_RETURN_VOID();
 }
 
@@ -517,7 +486,6 @@ void
 starter_process_main(Datum dummy)
 {
 	elog(LOG, "pg_pageprep: starter process (pid: %u)", MyProcPid);
-	pg_usleep(3  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -559,7 +527,7 @@ starter_process_main(Datum dummy)
 				if (strcmp(dbname, "template0") == 0)
 					continue;
 
-				start_bgworker_dynamic(dbname);
+				start_bgworker_dynamic(dbname, InvalidOid, false);
 			}
 		}
 	}
@@ -569,7 +537,7 @@ starter_process_main(Datum dummy)
 }
 
 static void
-start_bgworker_dynamic(const char *dbname)
+start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 {
 	BackgroundWorker worker;
 	BackgroundWorkerHandle *bgw_handle;
@@ -577,9 +545,19 @@ start_bgworker_dynamic(const char *dbname)
 	int			idx;
 	char		buf[64];
 
+	dsm_segment		*seg;
+	WorkerArgs		*worker_args;
+
 	if (!dbname)
 		dbname = get_database_name(MyDatabaseId);
 	idx = acquire_slot(dbname);
+
+	/* initialize segment */
+	seg = dsm_create(sizeof(WorkerArgs), 0);
+	worker_args = (WorkerArgs *) dsm_segment_address(seg);
+	worker_args->idx = idx;
+	worker_args->relid = relid;
+	worker_args->async = !wait;
 
 	/* Initialize worker struct */
 	memcpy(buf, dbname, sizeof(buf));
@@ -595,7 +573,7 @@ start_bgworker_dynamic(const char *dbname)
 #if PG_VERSION_NUM < 100000
 	worker.bgw_main				= NULL;
 #endif
-	worker.bgw_main_arg			= Int32GetDatum(idx);
+	worker.bgw_main_arg			= UInt32GetDatum(dsm_segment_handle(seg));
 	worker.bgw_notify_pid		= MyProcPid;
 
 	/* Start dynamic worker */
@@ -605,6 +583,18 @@ start_bgworker_dynamic(const char *dbname)
 	/* Wait till the worker starts */
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
 		elog(ERROR, "Postmaster died during bgworker startup");
+
+	/* Wait to be signalled. */
+	WaitLatch(MyLatch, WL_LATCH_SET, 0);
+
+	/* Reset the latch so we don't spin. */
+	ResetLatch(MyLatch);
+
+	/* Remove the segment */
+	dsm_detach(seg);
+
+	/* An interrupt may have occurred while we were waiting. */
+	CHECK_FOR_INTERRUPTS();
 }
 
 static int
@@ -658,7 +648,36 @@ find_database_slot(const char *dbname)
 void
 worker_main(Datum arg)
 {
-	MyWorkerIndex = DatumGetInt32(arg);
+	WorkerArgs	   *worker_args;
+	dsm_segment	   *seg;
+	PGPROC		   *starter;
+	Oid				worker_relid;
+	bool			async;
+
+	/* Establish signal handlers before unblocking signals */
+	pqsignal(SIGTERM, handle_sigterm);
+
+	/* We're now ready to receive signals */
+	BackgroundWorkerUnblockSignals();
+
+	/* Create resource owner */
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
+
+	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
+	worker_args = (WorkerArgs *) dsm_segment_address(seg);
+
+	/* keep the arguments */
+	MyWorkerIndex = worker_args->idx;
+	worker_relid = worker_args->relid;
+	async = worker_args->async;
+
+	dsm_detach(seg);
+	starter = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
+	if (starter == NULL)
+		elog(NOTICE, "starter worker has exited prematurely");
+	else if (async)
+		/* let start other workers */
+		SetLatch(&starter->procLatch);
 
 	elog(LOG, "pg_pageprep: worker is started (pid: %u) for \"%s\" database",
 			MyProcPid, worker_data[MyWorkerIndex].dbname);
@@ -671,19 +690,9 @@ worker_main(Datum arg)
 
 	worker_data[MyWorkerIndex].pid = MyProcPid;
 	worker_data[MyWorkerIndex].status = WS_ACTIVE;
-	pg_usleep(10  * 1000000L);	/* ten seconds; TODO remove it in the release */
 
 	PG_TRY();
 	{
-		/* Establish signal handlers before unblocking signals */
-		pqsignal(SIGTERM, handle_sigterm);
-
-		/* We're now ready to receive signals */
-		BackgroundWorkerUnblockSignals();
-
-		/* Create resource owner */
-		CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
-
 		/* Establish connection and start transaction */
 		BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
 											 pg_pageprep_role);
@@ -726,17 +735,28 @@ worker_main(Datum arg)
 			}
 			else elog(ERROR, "SPI initialization error");
 
-			relid = get_next_relation();
+			if (OidIsValid(worker_relid))
+				relid = worker_relid;
+			else
+				relid = get_next_relation();
+
 			if (!OidIsValid(relid))
 			{
 				finish_xact_command();
+				if (!async)
+				{
+					/* if worker is not async we need to finish and return */
+					worker_data[MyWorkerIndex].status = WS_STOPPED;
+					break;
+				}
+
 				worker_data[MyWorkerIndex].status = WS_IDLE;
 				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 				continue;
 			}
 
 			rel = heap_open(relid, AccessShareLock);
-			before_scan(rel);
+			add_relation_to_jobs(rel);
 			update_fillfactor(rel);
 
 			elog(LOG, "pg_pageprep (%s): scanning pages for %s",
@@ -762,6 +782,9 @@ worker_main(Datum arg)
 				finish_xact_command();
 			}
 
+			if (OidIsValid(worker_relid))
+				break;
+
 			pg_usleep(pg_pageprep_per_relation_delay * 1000L);
 		}
 	}
@@ -773,6 +796,13 @@ worker_main(Datum arg)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	/* worker is ending, let the starter know about it */
+	if (!async)
+		SetLatch(&starter->procLatch);
+
+	elog(LOG, "pg_pageprep: worker finished its work (pid: %u) for \"%s\" database",
+			MyProcPid, worker_data[MyWorkerIndex].dbname);
 }
 
 /*
@@ -858,6 +888,11 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 	uint32		tuples_moved = 0;
 	bool		reopen_relation = true;
 	bool		success = false;
+	bool		has_skipped_pages = false;
+	char		*relname = NULL;
+
+	MemoryContext oldcontext = CurrentMemoryContext;
+	ResourceOwner oldowner = CurrentResourceOwner;
 
 	*interrupted = false;
 	PG_TRY();
@@ -879,6 +914,7 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 
 				rel = heap_open(relid, RowExclusiveLock);
 				reopen_relation = false;
+				relname = generate_qualified_relation_name(relid);
 			}
 
 retry_block:
@@ -923,7 +959,7 @@ retry_block:
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
 				{
-					elog(NOTICE, "pg_pageprep: %s blkno=%u: all good, enough space after vacuum",
+					elog(LOG, "pg_pageprep: %s blkno=%u: all good, enough space after vacuum",
 						 generate_qualified_relation_name(relid),
 						 blkno);
 				}
@@ -939,20 +975,20 @@ retry_block:
 next_tuple:
 					tuple = get_next_tuple(rel, buf, blkno, &offnum);
 					LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+					reopen_relation = true;
 
 					/*
-					 * Could find any tuple. That's wierd. Probably this could
+					 * Could find any tuple. That's weird. Probably this could
 					 * happen if some transaction holds all the tuples on the
 					 * page
 					 */
 					if (!tuple)
-						elog(ERROR, "pg_pageprep: %s blkno=%u: cannot free any space",
-							 generate_qualified_relation_name(relid),
-							 blkno);
+					{
+						has_skipped_pages = true;
+						goto next_block;
+					}
 
-					reopen_relation = true;
 					new_tuple = heap_copytuple(tuple);
-					elog(LOG, "blkno: %u", blkno);
 
 					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
 					{
@@ -972,6 +1008,9 @@ next_tuple:
 
 						goto next_block;
 					}
+					elog(LOG, "pg_pageprep: %s blkno=%u: failed to update tuple, trying next",
+						 generate_qualified_relation_name(relid),
+						 blkno);
 					LockBuffer(buf, BUFFER_LOCK_SHARE);
 					goto next_tuple;
 				}
@@ -989,34 +1028,83 @@ next_block:
 			pg_usleep(pg_pageprep_per_page_delay * 1000L);
 		}
 
+		heap_close(rel, RowExclusiveLock);
+
+		elog(NOTICE,
+			 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
+			 worker_data[MyWorkerIndex].dbname,
+			 relname,
+			 blkno + 1,
+			 tuples_moved);
+
+		finish_xact_command();
+	}
+	PG_CATCH();
+	{
+		ErrorData  *error;
+		MemoryContextSwitchTo(oldcontext);
+		error = CopyErrorData();
+		elog(NOTICE, "pg_pageprep (%s): scanning error on %s (blkno: %u): %s",
+			 worker_data[MyWorkerIndex].dbname,
+			 relname,
+		 	 blkno,
+			 error->message);
+		FlushErrorState();
+
+		success = false;
+	}
+	PG_END_TRY();
+
+	start_xact_command();
+	BeginInternalSubTransaction(NULL);
+	MemoryContextSwitchTo(oldcontext);
+
+	PG_TRY();
+	{
+		start_xact_command();
+		relname = generate_qualified_relation_name(relid);
+
 		if (*interrupted)
 			update_status(relid, TS_INTERRUPTED);
+		else if (has_skipped_pages)
+		{
+			update_status(relid, TS_PARTLY);
+			success = true;
+		}
 		else
 		{
 			update_status(relid, TS_DONE);
 			success = true;
 		}
 
-		elog(LOG,
-			 "pg_pageprep (%s): finish page scan for %s (pages scanned: %u, tuples moved: %u)",
-			 get_database_name(MyDatabaseId),
-			 generate_qualified_relation_name(relid),
-			 blkno + 1,
-			 tuples_moved);
+		/* Commit the inner transaction, return to outer xact context */
+		ReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
 
-		heap_close(rel, RowExclusiveLock);
-		finish_xact_command();
 	}
 	PG_CATCH();
 	{
-		success = false;
-		elog(LOG, "pg_pageprep (%s): error occured while scanning %s (blkno: %u)",
+		ErrorData  *error;
+
+		MemoryContextSwitchTo(oldcontext);
+		error = CopyErrorData();
+		elog(NOTICE, "pg_pageprep (%s): status update error on %s: %s",
 			 worker_data[MyWorkerIndex].dbname,
-		 	 generate_qualified_relation_name(relid),
-		 	 blkno);
+			 relname,
+			 strdup(error->message));
+		FlushErrorState();
+
+		/* Abort the inner transaction */
+		RollbackAndReleaseCurrentSubTransaction();
+		MemoryContextSwitchTo(oldcontext);
+		CurrentResourceOwner = oldowner;
+
+		success = false;
 	}
 	PG_END_TRY();
 
+	finish_xact_command();
 	return success;
 }
 
@@ -1092,7 +1180,6 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber *start_
 		if (ItemIdIsNormal(lp))
 		{
 			HeapTupleData	tuple;
-			HeapTuple		tuple_copy;
 			HTSU_Result		res;
 
 			/* Build in-memory tuple representation */
@@ -1109,8 +1196,7 @@ get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber *start_
 			if (res != HeapTupleMayBeUpdated)
 				continue;
 
-			tuple_copy = heap_copytuple(&tuple);
-			return tuple_copy;
+			return heap_copytuple(&tuple);
 		}
 	}
 
@@ -1131,7 +1217,7 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 	HeapUpdateFailureData hufd;
 	LockTupleMode lockmode;
 
-	print_tuple(rel->rd_att, tuple);
+	/* print_tuple(rel->rd_att, tuple); */
 	result = heap_update(rel, lp, tuple,
 						 GetCurrentCommandId(true), InvalidSnapshot,
 						 true /* wait for commit */ ,
@@ -1158,7 +1244,6 @@ update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple)
 
 		default:
 			elog(ERROR, "pg_pageprep: unrecognized heap_update status: %u", result);
-			break;
 	}
 
 	return ret;
@@ -1244,7 +1329,7 @@ update_status(Oid relid, TaskStatus status)
 }
 
 static void
-before_scan(Relation rel)
+add_relation_to_jobs(Relation rel)
 {
 	Datum	values[2];
 	Oid		types[2] = {OIDOID, INT4OID};
@@ -1288,7 +1373,8 @@ update_fillfactor(Relation relation)
 			SPI_exec(query, 0);
 			SPI_finish();
 
-			elog(NOTICE, "fillfactor was updated for %d", relation->rd_id);
+			elog(NOTICE, "fillfactor was updated for \"%s\"",
+					generate_qualified_relation_name(relation->rd_id));
 
 			/* Invalidate relcache */
 			CacheInvalidateRelcacheByRelid(relation->rd_id);
@@ -1328,6 +1414,9 @@ generate_qualified_relation_name(Oid relid)
 	return result;
 }
 
+#ifdef __GNUC__
+__attribute__((unused))
+#endif
 static void
 print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 {

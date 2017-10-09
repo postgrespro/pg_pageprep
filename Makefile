@@ -15,3 +15,15 @@ top_builddir = ../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+ISOLATIONCHECKS=updates
+
+submake-isolation:
+	$(MAKE) -C $(top_builddir)/src/test/isolation all
+
+isolationcheck: | submake-isolation
+	$(MKDIR_P) isolation_output
+	$(pg_isolation_regress_check) \
+		--temp-config=$(top_srcdir)/$(subdir)/conf.add \
+		--outputdir=./isolation_output \
+		$(ISOLATIONCHECKS)
