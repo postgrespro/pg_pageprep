@@ -53,15 +53,18 @@ SELECT start_bgworker();
 
 DROP TABLE two CASCADE;
 
-CREATE TABLE two(a tsvector) WITH (fillfactor=100);
-INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
-CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
+CREATE TABLE three(a tsvector) WITH (fillfactor=100);
+INSERT INTO three SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
+CREATE MATERIALIZED VIEW view_three AS SELECT * FROM three;
 SELECT * FROM todo_list;
 
-/* should scan 'two' and 'view_two' */
+/* should scan 'three' and 'view_three' */
 SELECT start_bgworker();
 SELECT * FROM todo_list;
 SELECT * FROM jobs_list;
 
+DROP TABLE three CASCADE;
+
 DROP VIEW todo_list;
 DROP VIEW jobs_list;
+DROP EXTENSION pg_pageprep;
