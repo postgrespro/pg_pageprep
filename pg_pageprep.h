@@ -4,6 +4,7 @@
 #include "postgres.h"
 #include "access/sdir.h"
 #include "executor/execdesc.h"
+#include "parser/parse_node.h"
 
 typedef enum
 {
@@ -67,6 +68,10 @@ void pageprep_executor_hook(QueryDesc *queryDesc,
 						   ScanDirection direction,
 						   ExecutorRun_CountArgType count);
 #endif
+
+void pageprep_post_parse_analyze_hook(ParseState *pstate, Query *query);
+PlannedStmt *pageprep_planner_hook(Query *parse, int cursorOptions,
+		ParamListInfo boundParams);
 
 #define RelationIdCacheLookup(ID, RELATION) \
 do { \

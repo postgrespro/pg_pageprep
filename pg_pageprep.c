@@ -7,12 +7,8 @@
 #include "access/heapam.h"
 #include "access/htup.h"
 #include "access/htup_details.h"
-#include "access/reloptions.h"
-#include "access/sysattr.h"
 #include "access/xact.h"
-#include "catalog/indexing.h"
 #include "catalog/pg_type.h"
-#include "catalog/schemapg.h"
 #include "commands/tablecmds.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
@@ -22,6 +18,8 @@
 #include "miscadmin.h"
 #include "nodes/print.h"
 #include "nodes/execnodes.h"
+#include "optimizer/planner.h"
+#include "parser/analyze.h"
 #include "parser/parsetree.h"
 #include "postmaster/bgworker.h"
 #include "storage/buf.h"
@@ -33,9 +31,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
-#include "utils/catcache.h"
 #include "utils/guc.h"
-#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -67,12 +63,15 @@ static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
 static char *pg_pageprep_database = NULL;
 static bool pg_pageprep_enable_workers = true;
+static bool pg_pageprep_enable_runtime_fillfactor = true;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
 
 ExecutorRun_hook_type	executor_run_hook_next = NULL;
+post_parse_analyze_hook_type	post_parse_analyze_hook_next = NULL;
+planner_hook_type				planner_hook_next = NULL;
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
@@ -151,6 +150,12 @@ _PG_init(void)
 
 	executor_run_hook_next			= ExecutorRun_hook;
 	ExecutorRun_hook				= pageprep_executor_hook;
+
+	post_parse_analyze_hook_next	= post_parse_analyze_hook;
+	post_parse_analyze_hook			= pageprep_post_parse_analyze_hook;
+
+	planner_hook_next				= planner_hook;
+	planner_hook					= pageprep_planner_hook;
 }
 
 static void
@@ -222,6 +227,16 @@ setup_guc_variables(void)
 							 "Enable workers of pg_pageprep",
 							 NULL,
 							 &pg_pageprep_enable_workers,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+	DefineCustomBoolVariable("pg_pageprep.enable_runtime_fillfactor",
+							 "Enable change of fillfactor at runtime",
+							 NULL,
+							 &pg_pageprep_enable_runtime_fillfactor,
 							 true,
 							 PGC_SUSET,
 							 0,
@@ -657,6 +672,10 @@ set_relcache_fillfactor(Oid relid)
 {
 	Relation rel;
 
+	/* turned off */
+	if (!pg_pageprep_enable_runtime_fillfactor)
+		return;
+
 	rel = RelationIdGetRelation(relid);
 	if (RelationIsValid(rel))
 	{
@@ -670,6 +689,7 @@ set_relcache_fillfactor(Oid relid)
 			 rel->rd_rel->relkind == RELKIND_MATVIEW))
 		{
 			((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
+			elog(NOTICE, "runtime fillfactor set for %d", relid);
 		}
 		RelationClose(rel);
 	}
@@ -804,7 +824,6 @@ worker_main(Datum arg)
 				if (!async)
 				{
 					/* if worker is not async we need to finish and return */
-					worker_data[MyWorkerIndex].status = WS_STOPPED;
 					break;
 				}
 
@@ -817,8 +836,9 @@ worker_main(Datum arg)
 			add_relation_to_jobs(rel);
 			update_fillfactor(rel);
 
-			elog(LOG, "pg_pageprep (%s): scanning pages for %s",
+			elog(LOG, "pg_pageprep (%s): scanning %d pages of %s",
 				 get_database_name(MyDatabaseId),
+				 RelationGetNumberOfBlocks(rel),
 				 generate_qualified_relation_name(relid));
 			heap_close(rel, AccessShareLock);
 
@@ -854,6 +874,8 @@ worker_main(Datum arg)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	worker_data[MyWorkerIndex].status = WS_STOPPED;
 
 	/* worker is ending, let the starter know about it */
 	if (!async)
@@ -1514,8 +1536,7 @@ pageprep_executor_hook(QueryDesc *queryDesc,
 					  ExecutorRun_CountArgType count)
 #endif
 {
-	CmdType		cmd_type = queryDesc->plannedstmt->commandType;
-	if (cmd_type == CMD_UPDATE || cmd_type == CMD_INSERT)
+	if (queryDesc->plannedstmt->resultRelations)
 	{
 		ListCell	*lc;
 		foreach(lc, queryDesc->plannedstmt->resultRelations)
@@ -1529,11 +1550,48 @@ pageprep_executor_hook(QueryDesc *queryDesc,
 		}
 	}
 
-	register_hooks();
-
 	/* Call hooks set by other extensions if needed */
 	if (executor_run_hook_next)
 		EXECUTOR_HOOK_NEXT(queryDesc, direction, count);
 	/* Else call internal implementation */
 	else EXECUTOR_RUN(queryDesc, direction, count);
+}
+
+void
+pageprep_post_parse_analyze_hook(ParseState *pstate, Query *query)
+{
+	register_hooks();
+
+	if (query->utilityStmt)
+	{
+		Relation	rel;
+
+		if (IsA(query->utilityStmt, CopyStmt))
+		{
+			CopyStmt	*stmt;
+			stmt = (CopyStmt *) query->utilityStmt;
+			rel = heap_openrv(stmt->relation, AccessShareLock);
+			if (OidIsValid(rel->rd_rel->reltoastrelid))
+				set_relcache_fillfactor(rel->rd_rel->reltoastrelid);
+			heap_close(rel, AccessShareLock);
+		}
+	}
+
+	/* Invoke original hook if needed */
+	if (post_parse_analyze_hook_next)
+		post_parse_analyze_hook_next(pstate, query);
+}
+
+PlannedStmt *
+pageprep_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams)
+{
+	PlannedStmt	   *result;
+
+	/* Invoke original hook if needed */
+	if (planner_hook_next)
+		result = planner_hook_next(parse, cursorOptions, boundParams);
+	else
+		result = standard_planner(parse, cursorOptions, boundParams);
+
+	return result;
 }
