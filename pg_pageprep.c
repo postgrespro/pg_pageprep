@@ -72,8 +72,6 @@ static Worker *worker_data;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
 
-static const FormData_pg_attribute Desc_pg_class[Natts_pg_class] = {Schema_pg_class};
-
 ExecutorRun_hook_type	executor_run_hook_next = NULL;
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
@@ -127,7 +125,6 @@ static void add_relation_to_jobs(Relation rel);
 static void update_fillfactor(Relation);
 static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
-static HeapTuple scan_pg_class(Oid relid);
 
 
 void
@@ -655,63 +652,6 @@ find_database_slot(const char *dbname)
 	return -1;
 }
 
-/*
- * GetPgClassDescriptor -- get a predefined tuple descriptor for pg_class
- * GetPgIndexDescriptor -- get a predefined tuple descriptor for pg_index
- *
- * We need this kluge because we have to be able to access non-fixed-width
- * fields of pg_class and pg_index before we have the standard catalog caches
- * available.  We use predefined data that's set up in just the same way as
- * the bootstrapped reldescs used by formrdesc().  The resulting tupdesc is
- * not 100% kosher: it does not have the correct rowtype OID in tdtypeid, nor
- * does it have a TupleConstr field.  But it's good enough for the purpose of
- * extracting fields.
- */
-static TupleDesc
-BuildHardcodedDescriptor(int natts, const FormData_pg_attribute *attrs,
-						 bool hasoids)
-{
-	TupleDesc	result;
-	MemoryContext oldcxt;
-	int			i;
-
-	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
-
-	result = CreateTemplateTupleDesc(natts, hasoids);
-	result->tdtypeid = RECORDOID;		/* not right, but we don't care */
-	result->tdtypmod = -1;
-
-	for (i = 0; i < natts; i++)
-	{
-		memcpy(result->attrs[i], &attrs[i], ATTRIBUTE_FIXED_PART_SIZE);
-		/* make sure attcacheoff is valid */
-		result->attrs[i]->attcacheoff = -1;
-	}
-
-	/* initialize first attribute's attcacheoff, cf RelationBuildTupleDesc */
-	result->attrs[0]->attcacheoff = 0;
-
-	/* Note: we don't bother to set up a TupleConstr entry */
-
-	MemoryContextSwitchTo(oldcxt);
-
-	return result;
-}
-
-static TupleDesc
-GetPgClassDescriptor(void)
-{
-	static TupleDesc pgclassdesc = NULL;
-
-	/* Already done? */
-	if (pgclassdesc == NULL)
-		pgclassdesc = BuildHardcodedDescriptor(Natts_pg_class,
-											   Desc_pg_class,
-											   true);
-
-	return pgclassdesc;
-}
-
 static void
 set_relcache_fillfactor(Oid relid)
 {
@@ -724,25 +664,12 @@ set_relcache_fillfactor(Oid relid)
 
 		if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
 			(fillfactor < 0 || fillfactor > FILLFACTOR) &&
-			rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+			rel->rd_options != NULL &&
+			(rel->rd_rel->relkind == RELKIND_RELATION ||
+			 rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
+			 rel->rd_rel->relkind == RELKIND_MATVIEW))
 		{
-			HeapTuple tup;
-			bytea *options;
-
-			tup = scan_pg_class(relid);
-			options = extractRelOptions(tup, GetPgClassDescriptor(), NULL);
-			if (options != NULL)
-			{
-				rel->rd_options = MemoryContextAlloc(CacheMemoryContext, VARSIZE(options));
-				((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
-				memcpy(rel->rd_options, options, VARSIZE(options));
-				Assert(RelationGetFillFactor(rel, -1) == FILLFACTOR);
-				pfree(options);
-
-				elog(LOG, "Changed runtime fillfactor for TOAST table \"%s\"",
-						generate_qualified_relation_name(relid));
-			}
-			heap_freetuple(tup);
+			((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
 		}
 		RelationClose(rel);
 	}
@@ -756,10 +683,7 @@ pageprep_relcache_hook(Datum arg, Oid relid)
 		return;
 
 	if (IsTransactionState())
-	{
-		elog(NOTICE, "pageprep relcache hook for %d", relid);
 		set_relcache_fillfactor(relid);
-	}
 }
 
 static void
@@ -1612,50 +1536,4 @@ pageprep_executor_hook(QueryDesc *queryDesc,
 		EXECUTOR_HOOK_NEXT(queryDesc, direction, count);
 	/* Else call internal implementation */
 	else EXECUTOR_RUN(queryDesc, direction, count);
-}
-
-static HeapTuple
-scan_pg_class(Oid relid)
-{
-	HeapTuple	pg_class_tuple;
-	Relation	pg_class_desc;
-	SysScanDesc pg_class_scan;
-	ScanKeyData key[1];
-	Snapshot	snapshot;
-
-	/*
-	 * form a scan key
-	 */
-	ScanKeyInit(&key[0],
-				ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(relid));
-
-	/*
-	 * Open pg_class and fetch a tuple.  Force heap scan if we haven't yet
-	 * built the critical relcache entries (this includes initdb and startup
-	 * without a pg_internal.init file).  The caller can also force a heap
-	 * scan by setting indexOK == false.
-	 */
-	pg_class_desc = heap_open(RelationRelationId, AccessShareLock);
-	snapshot = GetCatalogSnapshot(RelationRelationId);
-
-	pg_class_scan = systable_beginscan(pg_class_desc, ClassOidIndexId,
-									   true,
-									   snapshot,
-									   1, key);
-
-	pg_class_tuple = systable_getnext(pg_class_scan);
-
-	/*
-	 * Must copy tuple before releasing buffer.
-	 */
-	if (HeapTupleIsValid(pg_class_tuple))
-		pg_class_tuple = heap_copytuple(pg_class_tuple);
-
-	/* all done */
-	systable_endscan(pg_class_scan);
-	heap_close(pg_class_desc, AccessShareLock);
-
-	return pg_class_tuple;
 }
