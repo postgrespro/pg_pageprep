@@ -8,8 +8,11 @@
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/reloptions.h"
+#include "access/sysattr.h"
 #include "access/xact.h"
+#include "catalog/indexing.h"
 #include "catalog/pg_type.h"
+#include "catalog/schemapg.h"
 #include "commands/tablecmds.h"
 #include "commands/dbcommands.h"
 #include "executor/executor.h"
@@ -19,6 +22,7 @@
 #include "miscadmin.h"
 #include "nodes/print.h"
 #include "nodes/execnodes.h"
+#include "parser/parsetree.h"
 #include "postmaster/bgworker.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
@@ -29,7 +33,9 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/guc.h"
+#include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -54,6 +60,7 @@ PG_MODULE_MAGIC;
  * 2. handle invalidation messages
  * 3. set fillfactor - done
  */
+int MyWorkerIndex = 0;
 
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
@@ -62,9 +69,12 @@ static char *pg_pageprep_database = NULL;
 static bool pg_pageprep_enable_workers = true;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
-int MyWorkerIndex = 0;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
+
+static const FormData_pg_attribute Desc_pg_class[Natts_pg_class] = {Schema_pg_class};
+
+ExecutorRun_hook_type	executor_run_hook_next = NULL;
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
@@ -117,6 +127,7 @@ static void add_relation_to_jobs(Relation rel);
 static void update_fillfactor(Relation);
 static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
+static HeapTuple scan_pg_class(Oid relid);
 
 
 void
@@ -140,6 +151,9 @@ _PG_init(void)
 		start_starter_process();
 	else
 		elog(LOG, "pg_pageprep: workers are disabled");
+
+	executor_run_hook_next			= ExecutorRun_hook;
+	ExecutorRun_hook				= pageprep_executor_hook;
 }
 
 static void
@@ -639,6 +653,126 @@ find_database_slot(const char *dbname)
 			return idx;
 
 	return -1;
+}
+
+/*
+ * GetPgClassDescriptor -- get a predefined tuple descriptor for pg_class
+ * GetPgIndexDescriptor -- get a predefined tuple descriptor for pg_index
+ *
+ * We need this kluge because we have to be able to access non-fixed-width
+ * fields of pg_class and pg_index before we have the standard catalog caches
+ * available.  We use predefined data that's set up in just the same way as
+ * the bootstrapped reldescs used by formrdesc().  The resulting tupdesc is
+ * not 100% kosher: it does not have the correct rowtype OID in tdtypeid, nor
+ * does it have a TupleConstr field.  But it's good enough for the purpose of
+ * extracting fields.
+ */
+static TupleDesc
+BuildHardcodedDescriptor(int natts, const FormData_pg_attribute *attrs,
+						 bool hasoids)
+{
+	TupleDesc	result;
+	MemoryContext oldcxt;
+	int			i;
+
+	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+
+	result = CreateTemplateTupleDesc(natts, hasoids);
+	result->tdtypeid = RECORDOID;		/* not right, but we don't care */
+	result->tdtypmod = -1;
+
+	for (i = 0; i < natts; i++)
+	{
+		memcpy(result->attrs[i], &attrs[i], ATTRIBUTE_FIXED_PART_SIZE);
+		/* make sure attcacheoff is valid */
+		result->attrs[i]->attcacheoff = -1;
+	}
+
+	/* initialize first attribute's attcacheoff, cf RelationBuildTupleDesc */
+	result->attrs[0]->attcacheoff = 0;
+
+	/* Note: we don't bother to set up a TupleConstr entry */
+
+	MemoryContextSwitchTo(oldcxt);
+
+	return result;
+}
+
+static TupleDesc
+GetPgClassDescriptor(void)
+{
+	static TupleDesc pgclassdesc = NULL;
+
+	/* Already done? */
+	if (pgclassdesc == NULL)
+		pgclassdesc = BuildHardcodedDescriptor(Natts_pg_class,
+											   Desc_pg_class,
+											   true);
+
+	return pgclassdesc;
+}
+
+static void
+set_relcache_fillfactor(Oid relid)
+{
+	Relation rel;
+
+	rel = RelationIdGetRelation(relid);
+	if (RelationIsValid(rel))
+	{
+		int fillfactor = RelationGetFillFactor(rel, -1);
+
+		if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP &&
+			(fillfactor < 0 || fillfactor > FILLFACTOR) &&
+			rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+		{
+			HeapTuple tup;
+			bytea *options;
+
+			tup = scan_pg_class(relid);
+			options = extractRelOptions(tup, GetPgClassDescriptor(), NULL);
+			if (options != NULL)
+			{
+				rel->rd_options = MemoryContextAlloc(CacheMemoryContext, VARSIZE(options));
+				((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
+				memcpy(rel->rd_options, options, VARSIZE(options));
+				Assert(RelationGetFillFactor(rel, -1) == FILLFACTOR);
+				pfree(options);
+
+				elog(LOG, "Changed runtime fillfactor for TOAST table \"%s\"",
+						generate_qualified_relation_name(relid));
+			}
+			heap_freetuple(tup);
+		}
+		RelationClose(rel);
+	}
+}
+
+void
+pageprep_relcache_hook(Datum arg, Oid relid)
+{
+	/* We shouldn't even consider special OIDs */
+	if (relid < FirstNormalObjectId)
+		return;
+
+	if (IsTransactionState())
+	{
+		elog(NOTICE, "pageprep relcache hook for %d", relid);
+		set_relcache_fillfactor(relid);
+	}
+}
+
+static void
+register_hooks(void)
+{
+	static bool callback_needed = true;
+
+	/* Register pageprep_relcache_hook(), currently we can't unregister it */
+	if (callback_needed)
+	{
+		CacheRegisterRelcacheCallback(pageprep_relcache_hook, PointerGetDatum(NULL));
+		callback_needed = false;
+	}
 }
 
 /*
@@ -1430,4 +1564,98 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 	print_slot(slot);
 
 	ReleaseTupleDesc(tupdesc);
+}
+
+#if PG_VERSION_NUM >= 100000
+#define EXECUTOR_HOOK_NEXT(q,d,c) executor_run_hook_next((q),(d),(c), execute_once)
+#define EXECUTOR_RUN(q,d,c) standard_ExecutorRun((q),(d),(c), execute_once)
+#else
+#define EXECUTOR_HOOK_NEXT(q,d,c) executor_run_hook_next((q),(d),(c))
+#define EXECUTOR_RUN(q,d,c) standard_ExecutorRun((q),(d),(c))
+#endif
+
+/*
+ * Executor hook (for PartitionRouter).
+ */
+#if PG_VERSION_NUM >= 100000
+void
+pageprep_executor_hook(QueryDesc *queryDesc,
+					  ScanDirection direction,
+					  ExecutorRun_CountArgType count,
+					  bool execute_once)
+#else
+void
+pageprep_executor_hook(QueryDesc *queryDesc,
+					  ScanDirection direction,
+					  ExecutorRun_CountArgType count)
+#endif
+{
+	CmdType		cmd_type = queryDesc->plannedstmt->commandType;
+	if (cmd_type == CMD_UPDATE || cmd_type == CMD_INSERT)
+	{
+		ListCell	*lc;
+		foreach(lc, queryDesc->plannedstmt->resultRelations)
+		{
+			Index	idx = lfirst_int(lc);
+			RangeTblEntry	*rte = rt_fetch(idx, queryDesc->plannedstmt->rtable);
+			Relation rel = heap_open(rte->relid, NoLock);
+			if (OidIsValid(rel->rd_rel->reltoastrelid))
+				set_relcache_fillfactor(rel->rd_rel->reltoastrelid);
+			heap_close(rel, NoLock);
+		}
+	}
+
+	register_hooks();
+
+	/* Call hooks set by other extensions if needed */
+	if (executor_run_hook_next)
+		EXECUTOR_HOOK_NEXT(queryDesc, direction, count);
+	/* Else call internal implementation */
+	else EXECUTOR_RUN(queryDesc, direction, count);
+}
+
+static HeapTuple
+scan_pg_class(Oid relid)
+{
+	HeapTuple	pg_class_tuple;
+	Relation	pg_class_desc;
+	SysScanDesc pg_class_scan;
+	ScanKeyData key[1];
+	Snapshot	snapshot;
+
+	/*
+	 * form a scan key
+	 */
+	ScanKeyInit(&key[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+
+	/*
+	 * Open pg_class and fetch a tuple.  Force heap scan if we haven't yet
+	 * built the critical relcache entries (this includes initdb and startup
+	 * without a pg_internal.init file).  The caller can also force a heap
+	 * scan by setting indexOK == false.
+	 */
+	pg_class_desc = heap_open(RelationRelationId, AccessShareLock);
+	snapshot = GetCatalogSnapshot(RelationRelationId);
+
+	pg_class_scan = systable_beginscan(pg_class_desc, ClassOidIndexId,
+									   true,
+									   snapshot,
+									   1, key);
+
+	pg_class_tuple = systable_getnext(pg_class_scan);
+
+	/*
+	 * Must copy tuple before releasing buffer.
+	 */
+	if (HeapTupleIsValid(pg_class_tuple))
+		pg_class_tuple = heap_copytuple(pg_class_tuple);
+
+	/* all done */
+	systable_endscan(pg_class_scan);
+	heap_close(pg_class_desc, AccessShareLock);
+
+	return pg_class_tuple;
 }
