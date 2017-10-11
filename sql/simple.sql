@@ -4,16 +4,16 @@
 SHOW pg_pageprep.enable_workers;
 
 /* minimal delays */
-SET pg_pageprep.per_relation_delay=1;
-SET pg_pageprep.per_page_delay=1;
+SET pg_pageprep.per_relation_delay=0;
+SET pg_pageprep.per_page_delay=0;
 
 CREATE EXTENSION pg_pageprep;
 CREATE VIEW todo_list AS
-	SELECT regexp_replace(relname::text, '\d+'::text, '0') as relname, status
+	SELECT regexp_replace(relname::text, '\d+'::text, '0') as rel1, status
 	FROM pg_pageprep_todo
 	ORDER BY relname;
 CREATE VIEW jobs_list AS
-	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel, fillfactor, status
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
 	FROM pg_pageprep_jobs
 	ORDER BY rel;
 

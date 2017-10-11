@@ -7,23 +7,23 @@ SHOW pg_pageprep.enable_workers;
 (1 row)
 
 /* minimal delays */
-SET pg_pageprep.per_relation_delay=1;
-SET pg_pageprep.per_page_delay=1;
+SET pg_pageprep.per_relation_delay=0;
+SET pg_pageprep.per_page_delay=0;
 CREATE EXTENSION pg_pageprep;
 CREATE VIEW todo_list AS
-	SELECT regexp_replace(relname::text, '\d+'::text, '0') as relname, status
+	SELECT regexp_replace(relname::text, '\d+'::text, '0') as rel1, status
 	FROM pg_pageprep_todo
 	ORDER BY relname;
 CREATE VIEW jobs_list AS
-	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel, fillfactor, status
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
 	FROM pg_pageprep_jobs
 	ORDER BY rel;
 CREATE TABLE one(a INT4) WITH (fillfactor=100);
 SELECT * FROM todo_list;
-     relname      | status 
-------------------+--------
- one              | 
- pg_pageprep_jobs | 
+    rel1    | status 
+------------+--------
+ one        | 
+ pg_toast_0 | 
 (2 rows)
 
 INSERT INTO one SELECT i FROM generate_series(1, 1000) i;
@@ -36,7 +36,7 @@ Options: fillfactor=100
 
 SELECT scan_pages('one'::regclass);
 NOTICE:  fillfactor was updated for "public.one"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 6, tuples moved: 0)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -50,20 +50,20 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (page
 Options: fillfactor=90
 
 SELECT * FROM todo_list;
-     relname      | status 
-------------------+--------
- pg_pageprep_jobs | 
+    rel1    | status 
+------------+--------
+ pg_toast_0 | 
 (1 row)
 
 SELECT * FROM jobs_list;
- rel | fillfactor | status 
------+------------+--------
- one |        100 | done
+ rel1 | fillfactor | status | updated 
+------+------------+--------+---------
+ one  |        100 | done   |       0
 (1 row)
 
 /* should be zero updated */
 SELECT scan_pages('one'::regclass);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 6, tuples moved: 0)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -74,18 +74,18 @@ CREATE TABLE two(a tsvector) WITH (fillfactor=100);
 INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
 SELECT * FROM todo_list;
-     relname      | status 
-------------------+--------
- pg_pageprep_jobs | 
- pg_toast_0       | 
- pg_toast_0       | 
- two              | 
- view_two         | 
+    rel1    | status 
+------------+--------
+ pg_toast_0 | 
+ pg_toast_0 | 
+ pg_toast_0 | 
+ two        | 
+ view_two   | 
 (5 rows)
 
 SELECT scan_pages('two'::REGCLASS);
 NOTICE:  fillfactor was updated for "public.two"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 10, tuples moved: 8)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 8)
  scan_pages 
 ------------
  
@@ -93,37 +93,37 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (page
 
 SELECT scan_pages('view_two'::REGCLASS);
 NOTICE:  fillfactor was updated for "public.view_two"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 10, tuples moved: 8)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 8)
  scan_pages 
 ------------
  
 (1 row)
 
 SELECT * FROM todo_list;
-     relname      | status 
-------------------+--------
- pg_pageprep_jobs | 
- pg_toast_0       | 
- pg_toast_0       | 
+    rel1    | status 
+------------+--------
+ pg_toast_0 | 
+ pg_toast_0 | 
+ pg_toast_0 | 
 (3 rows)
 
 SELECT * FROM jobs_list;
-   rel    | fillfactor | status 
-----------+------------+--------
- two      |        100 | done
- view_two |        100 | done
+   rel1   | fillfactor | status | updated 
+----------+------------+--------+---------
+ two      |        100 | done   |       8
+ view_two |        100 | done   |       8
 (2 rows)
 
 /* should be zeros */
 SELECT scan_pages('two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 10, tuples moved: 0)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 0)
  scan_pages 
 ------------
  
 (1 row)
 
 SELECT scan_pages('view_two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 10, tuples moved: 0)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -132,7 +132,7 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two 
 INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 /* should be still zero */
 SELECT scan_pages('two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 19, tuples moved: 0)
+NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 18, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -151,7 +151,7 @@ CREATE TABLE three(a tsvector) WITH (fillfactor=100);
 INSERT INTO three SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 CREATE MATERIALIZED VIEW view_three AS SELECT * FROM three;
 SELECT * FROM todo_list;
-  relname   | status 
+    rel1    | status 
 ------------+--------
  pg_toast_0 | 
  pg_toast_0 | 
@@ -167,18 +167,18 @@ SELECT start_bgworker();
 (1 row)
 
 SELECT * FROM todo_list;
- relname | status 
----------+--------
+ rel1 | status 
+------+--------
 (0 rows)
 
 SELECT * FROM jobs_list;
-         rel         | fillfactor | status 
----------------------+------------+--------
- pg_pageprep_jobs    |        100 | done
- pg_toast.pg_toast_0 |        100 | done
- pg_toast.pg_toast_0 |        100 | done
- three               |        100 | done
- view_three          |        100 | done
+        rel1         | fillfactor | status | updated 
+---------------------+------------+--------+---------
+ pg_toast.pg_toast_0 |        100 | done   |       0
+ three               |        100 | done   |       8
+ pg_toast.pg_toast_0 |        100 | done   |       0
+ view_three          |        100 | done   |       8
+ pg_toast.pg_toast_0 |        100 | done   |       0
 (5 rows)
 
 DROP TABLE three CASCADE;

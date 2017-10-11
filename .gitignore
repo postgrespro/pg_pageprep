@@ -5,3 +5,5 @@
 /results
 regression.diffs
 regression.out
+sql/toast.sql
+expected/toast.out

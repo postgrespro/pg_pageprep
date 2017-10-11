@@ -1,16 +1,8 @@
-drop type if exists pg_pageprep_status;
-create type pg_pageprep_status as enum (
-	'new',
-	'in progress',
-	'partly done',
-	'interrupted',
-	'failed',
-	'done'
-);
 create table pg_pageprep_jobs (
 	rel			regclass,			/* relation */
 	fillfactor	integer,			/* original fillfactor value */
-	status		pg_pageprep_status	/* processing status: new, in process, done, failed */
+	status		text,				/* 'done' means done */
+	updated		integer
 );
 create unique index pg_pageprep_data_idx on pg_pageprep_jobs (rel);
 
@@ -36,7 +28,7 @@ execute procedure pg_pageprep_event_trigger();
 create or replace function scan_pages(
 	rel			regclass
 )
-returns void as 'MODULE_PATHNAME', 'scan_pages'
+returns void as 'MODULE_PATHNAME', 'scan_pages_pl'
 language c strict;
 
 
@@ -62,9 +54,11 @@ create view pg_pageprep_todo as (
 	left join @extschema@.pg_pageprep_jobs p on p.rel = c.oid
 	where
 		relkind in ('r', 't', 'm') and
+		relname != 'pg_pageprep_jobs' and
 		relpersistence != 't' and
 		c.oid >= 16384 and
 		(status IS NULL OR status != 'done')
+	order by c.relname
 );
 
 create or replace function __add_job(rel regclass, fillfactor integer)
@@ -73,16 +67,6 @@ $$
 	insert into @extschema@.pg_pageprep_jobs
 	values (rel, fillfactor, 'new')
 	on conflict (rel) do nothing;
-$$
-language sql;
-
-
-create or replace function __update_status(rel regclass, status text)
-returns void as
-$$
-	update @extschema@.pg_pageprep_jobs
-	set status = $2::@extschema@.pg_pageprep_status
-	where rel = $1;
 $$
 language sql;
 

@@ -3,7 +3,7 @@ EXTENSION = pg_pageprep
 DATA = pg_pageprep--0.1.sql
 
 OBJS = pg_pageprep.o
-REGRESS = simple
+REGRESS = simple toast
 
 ifdef USE_PGXS
 PG_CONFIG = pg_config
