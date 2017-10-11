@@ -34,6 +34,7 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -1512,6 +1513,41 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 	ReleaseTupleDesc(tupdesc);
 }
 
+static void (*orig_intorel_startup)
+	(DestReceiver *self, int operation, TupleDesc typeinfo) = NULL;
+
+static void
+our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	int					count = 0;
+	MemoryContext		oldcontext;
+	DR_intorel_hdr	   *dest = (DR_intorel_hdr *) self;
+	IntoClause		   *into = dest->into;
+	DefElem			   *def;
+	ListCell		   *lc;
+
+	foreach(lc, into->options)
+	{
+		def = (DefElem *) lfirst(lc);
+		if (strcmp(def->defnamespace, "toast") == 0)
+			count++;
+	}
+
+	if (count == 0)
+	{
+		/*
+		 * we just add one parameter to make that reloptions will be created
+		 * and we can fill fillfactor at relcache hook
+		 */
+		oldcontext = MemoryContextSwitchTo(MessageContext);
+		def = makeDefElemExtended("toast", "autovacuum_enabled", NULL, DEFELEM_SET);
+		into->options = lappend(into->options, def);
+		MemoryContextSwitchTo(oldcontext);
+	}
+
+	orig_intorel_startup(self, operation, typeinfo);
+}
+
 #if PG_VERSION_NUM >= 100000
 #define EXECUTOR_HOOK_NEXT(q,d,c) executor_run_hook_next((q),(d),(c), execute_once)
 #define EXECUTOR_RUN(q,d,c) standard_ExecutorRun((q),(d),(c), execute_once)
@@ -1520,9 +1556,6 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 #define EXECUTOR_RUN(q,d,c) standard_ExecutorRun((q),(d),(c))
 #endif
 
-/*
- * Executor hook (for PartitionRouter).
- */
 #if PG_VERSION_NUM >= 100000
 void
 pageprep_executor_hook(QueryDesc *queryDesc,
@@ -1548,6 +1581,14 @@ pageprep_executor_hook(QueryDesc *queryDesc,
 				set_relcache_fillfactor(rel->rd_rel->reltoastrelid);
 			heap_close(rel, NoLock);
 		}
+	}
+
+	if (queryDesc->dest && queryDesc->dest->mydest == DestIntoRel)
+	{
+		if (orig_intorel_startup == NULL)
+			orig_intorel_startup = queryDesc->dest->rStartup;
+
+		queryDesc->dest->rStartup = our_intorel_startup;
 	}
 
 	/* Call hooks set by other extensions if needed */

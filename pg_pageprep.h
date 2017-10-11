@@ -50,7 +50,17 @@ typedef struct
 	bool	async;
 } WorkerArgs;
 
+/* this is beginning of DR_intorel */
+/* TODO: check it's same in 9.6, 10 and PG Pro Standard, PG Pro EE 9.6 */
+typedef struct
+{
+	DestReceiver pub;			/* publicly-known function pointers */
+	IntoClause *into;			/* target relation specification */
+	Relation	rel;			/* relation to write to */
+} DR_intorel_hdr;
+
 void pageprep_relcache_hook(Datum arg, Oid relid);
+typedef struct _anon DR_intorel;
 
 #if PG_VERSION_NUM >= 90600
 typedef uint64 ExecutorRun_CountArgType;
