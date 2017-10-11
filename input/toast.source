@@ -1,0 +1,48 @@
+\set verbosity terse
+
+/* should be off for testing */
+SHOW pg_pageprep.enable_workers;
+
+/* minimal delays */
+SET pg_pageprep.per_relation_delay=0;
+SET pg_pageprep.per_page_delay=0;
+SET pg_pageprep.enable_runtime_fillfactor=off;
+
+CREATE EXTENSION pg_pageprep;
+CREATE VIEW jobs_list AS
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
+	FROM pg_pageprep_jobs
+	ORDER BY rel;
+
+CREATE TABLE ten (id SERIAL, msg TEXT);
+ALTER TABLE ten ALTER COLUMN msg SET STORAGE EXTERNAL;
+COPY ten FROM '@abs_srcdir@/input/toast.csv';
+SELECT start_bgworker();
+SELECT * FROM jobs_list;
+
+SET pg_pageprep.enable_runtime_fillfactor=on;
+COPY ten FROM '@abs_srcdir@/input/toast.csv';
+DELETE FROM pg_pageprep_jobs;
+SELECT start_bgworker();
+SELECT * FROM jobs_list;
+
+CREATE TABLE eleven AS SELECT * FROM ten;
+SELECT start_bgworker();
+SELECT * FROM jobs_list;
+
+DROP TABLE eleven;
+
+SET pg_pageprep.enable_runtime_fillfactor=on;
+CREATE TABLE thirteen (LIKE ten);
+ALTER TABLE thirteen ALTER COLUMN msg SET STORAGE EXTERNAL;
+SELECT start_bgworker();
+
+DELETE FROM pg_pageprep_jobs;
+INSERT INTO thirteen SELECT * FROM ten;
+DROP TABLE ten;
+
+SELECT start_bgworker();
+SELECT * FROM jobs_list;
+
+DROP VIEW jobs_list;
+DROP EXTENSION pg_pageprep;

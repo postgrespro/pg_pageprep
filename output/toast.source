@@ -1,0 +1,97 @@
+\set verbosity terse
+/* should be off for testing */
+SHOW pg_pageprep.enable_workers;
+ pg_pageprep.enable_workers 
+----------------------------
+ off
+(1 row)
+
+/* minimal delays */
+SET pg_pageprep.per_relation_delay=0;
+SET pg_pageprep.per_page_delay=0;
+SET pg_pageprep.enable_runtime_fillfactor=off;
+CREATE EXTENSION pg_pageprep;
+CREATE VIEW jobs_list AS
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
+	FROM pg_pageprep_jobs
+	ORDER BY rel;
+CREATE TABLE ten (id SERIAL, msg TEXT);
+ALTER TABLE ten ALTER COLUMN msg SET STORAGE EXTERNAL;
+COPY ten FROM '@abs_srcdir@/input/toast.csv';
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+SELECT * FROM jobs_list;
+        rel1         | fillfactor | status | updated 
+---------------------+------------+--------+---------
+ pg_toast.pg_toast_0 |        100 | done   |       0
+ ten                 |        100 | done   |       0
+ pg_toast.pg_toast_0 |        100 | done   |       1
+(3 rows)
+
+SET pg_pageprep.enable_runtime_fillfactor=on;
+COPY ten FROM '@abs_srcdir@/input/toast.csv';
+DELETE FROM pg_pageprep_jobs;
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+SELECT * FROM jobs_list;
+        rel1         | fillfactor | status | updated 
+---------------------+------------+--------+---------
+ pg_toast.pg_toast_0 |         90 | done   |       0
+ ten                 |         90 | done   |       0
+ pg_toast.pg_toast_0 |        100 | done   |       0
+(3 rows)
+
+CREATE TABLE eleven AS SELECT * FROM ten;
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+SELECT * FROM jobs_list;
+        rel1         | fillfactor | status | updated 
+---------------------+------------+--------+---------
+ pg_toast.pg_toast_0 |         90 | done   |       0
+ ten                 |         90 | done   |       0
+ pg_toast.pg_toast_0 |        100 | done   |       0
+ eleven              |        100 | done   |       1
+ pg_toast.pg_toast_0 |        100 | done   |       0
+(5 rows)
+
+DROP TABLE eleven;
+SET pg_pageprep.enable_runtime_fillfactor=on;
+CREATE TABLE thirteen (LIKE ten);
+ALTER TABLE thirteen ALTER COLUMN msg SET STORAGE EXTERNAL;
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+DELETE FROM pg_pageprep_jobs;
+INSERT INTO thirteen SELECT * FROM ten;
+DROP TABLE ten;
+SELECT start_bgworker();
+ start_bgworker 
+----------------
+ 
+(1 row)
+
+SELECT * FROM jobs_list;
+        rel1         | fillfactor | status | updated 
+---------------------+------------+--------+---------
+ pg_toast.pg_toast_0 |        100 | done   |       0
+ thirteen            |         90 | done   |       0
+ pg_toast.pg_toast_0 |        100 | done   |       0
+(3 rows)
+
+DROP VIEW jobs_list;
+DROP EXTENSION pg_pageprep;
