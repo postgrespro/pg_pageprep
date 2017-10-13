@@ -25,6 +25,7 @@
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parsetree.h"
+#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
@@ -619,7 +620,11 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 
 	while (!worker_args->latch_set)
 		/* Wait to be signalled. */
+#if PG_VERSION_NUM >= 100000
+		WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+#else
 		WaitLatch(MyLatch, WL_LATCH_SET, 0);
+#endif
 
 	/* Reset the latch so we don't spin. */
 	ResetLatch(MyLatch);
@@ -1618,7 +1623,11 @@ our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 		 * and we can fill fillfactor at relcache hook
 		 */
 		oldcontext = MemoryContextSwitchTo(MessageContext);
+#if PG_VERSION_NUM >= 100000
+		def = makeDefElemExtended("toast", "autovacuum_enabled", NULL, DEFELEM_SET, -1);
+#else
 		def = makeDefElemExtended("toast", "autovacuum_enabled", NULL, DEFELEM_SET);
+#endif
 		into->options = lappend(into->options, def);
 		MemoryContextSwitchTo(oldcontext);
 	}
