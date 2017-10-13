@@ -3,7 +3,7 @@ create table pg_pageprep_jobs (
 	fillfactor	integer,			/* original fillfactor value */
 	status		text,				/* 'done' means done */
 	updated		integer
-);
+) with (fillfactor=90);
 create unique index pg_pageprep_data_idx on pg_pageprep_jobs (rel);
 
 create or replace function pg_pageprep_event_trigger()
