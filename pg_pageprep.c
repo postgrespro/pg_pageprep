@@ -1182,12 +1182,14 @@ next_block:
  *		Can we remove old tuples in order to free enough space?
  */
 static bool
-can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_space)
+can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
+		size_t *free_space)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
 	ItemId			lp;
 	Page			page = BufferGetPage(buf);
+	bool			found_normal = false;
 
 	lp_count = PageGetMaxOffsetNumber(page);
 
@@ -1200,6 +1202,8 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_
 		{
 			TransactionId	xid = GetOldestXmin_compat(rel);
 			HeapTupleData	heaptup;
+
+			found_normal = true;
 
 			/* Build in-memory tuple representation */
 			heaptup.t_tableOid = RelationGetRelid(rel);
@@ -1220,6 +1224,9 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno, size_t *free_
 			}
 		}
 	}
+
+	if (!found_normal)
+		return true;
 
 	return false;
 }
@@ -1485,7 +1492,7 @@ update_status(Oid relid, TaskStatus status, int updated)
 
 	newtup = heap_modify_tuple(oldtup, RelationGetDescr(rel),
 								 values, nulls, replaces);
-	simple_heap_update(rel, &newtup->t_self, newtup);
+	simple_heap_update(rel, &oldtup->t_self, newtup);
 	heap_close(rel, RowExclusiveLock);
 
 end:
