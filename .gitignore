@@ -7,3 +7,6 @@ regression.diffs
 regression.out
 sql/toast.sql
 expected/toast.out
+/checker/postgrespro
+/checker/*.log
+/checker/build
