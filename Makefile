@@ -6,7 +6,9 @@ OBJS = pg_pageprep.o
 REGRESS = simple toast
 
 ifdef USE_PGXS
+ifndef PG_CONFIG
 PG_CONFIG = pg_config
+endif
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 else

@@ -149,6 +149,9 @@ if __name__ == '__main__':
     for key, options in conf.items():
         prefix_dir = rel('build', key)
 
+        if args.branch and key != dest_name and args.branch != key:
+            continue
+
         if os.path.exists(prefix_dir):
             print("%s already built in '%s'. skipped" % (key, prefix_dir))
             continue
@@ -168,15 +171,15 @@ if __name__ == '__main__':
         for key, options in conf.items():
             prefix_dir = rel('build', key)
 
+            if args.branch and key != args.branch and key != dest_name:
+                continue
+
             set_environ_for(key)
             with cwd(pageprep_dir):
                 cmd('make clean', env=os.environ)
                 cmd('make install', env=os.environ)
 
             if key == dest_name:
-                continue
-
-            if args.branch and key != args.branch:
                 continue
 
             with get_new_node('node_%s' % key, base_dir=prefix_dir, use_logging=True) as node:
@@ -204,10 +207,6 @@ if __name__ == '__main__':
 
             #TODO: remove these two lines when icu error will be fixed
             if key == 'pgpro10_standard':
-                continue
-
-            # ERROR:  index "pgbench_branches_pkey" contains corrupted page at block 0
-            if key == 'pgpro96_enterprise':
                 continue
 
             if args.branch and key != args.branch:
