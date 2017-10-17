@@ -1210,6 +1210,10 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
 			heaptup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			heaptup.t_len = ItemIdGetLength(lp);
 			ItemPointerSet(&(heaptup.t_self), blkno, lp_offset);
+#if defined(PGPRO_EE) && PG_VERSION_NUM < 100000
+			heaptup.t_xid_epoch = ((PageHeader) page)->pd_xid_epoch;
+			heaptup.t_multi_epoch = ((PageHeader) page)->pd_multi_epoch;
+#endif
 
 			/* Can we remove this tuple? */
 			switch (HeapTupleSatisfiesVacuum(&heaptup, xid, buf))
