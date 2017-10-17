@@ -135,6 +135,8 @@ if __name__ == '__main__':
             dest='check_upgrade', action='store_true')
     parser.add_argument("--branch", help="check only one branch",
             dest='branch', default=None, action='store')
+    parser.add_argument("--bench-time", help="time for pgbench",
+            dest='bench_time', default=60, action='store', type=int)
     args = parser.parse_args()
 
     configure_testgres(cache_initdb=False, cache_pg_config=False)
@@ -190,9 +192,9 @@ if __name__ == '__main__':
                 # add our testing tables and start pg_pageprep
                 node.psql('postgres',  sql_fill.format(pageprep_dir))
 
-                print("run: pgbench for ", key)
+                print("run: pgbench %s before upgrade for %s seconds" % (key, args.bench_time))
                 node.pgbench_init(scale=10)
-                p = node.pgbench(options=['--time', '100', '-c', '4', '-j', '8'])
+                p = node.pgbench(options=['--time', str(args.bench_time), '-c', '4', '-j', '8'])
                 p.wait()
 
                 node.psql('postgres', 'drop extension pg_pageprep;')
@@ -216,6 +218,7 @@ if __name__ == '__main__':
                 cmd('rm -rf ./data')
                 cmd('bin/initdb -D ./data')
 
+            set_environ_for(dest_name)
             with get_new_node('node_%s' % dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
                 node.default_conf(log_statement='ddl')
@@ -224,14 +227,20 @@ if __name__ == '__main__':
             dest_conf = conf[dest_name]
             with cwd(rel('build')):
                 cmd("{0}/bin/pg_upgrade -b {1}/bin -d {1}/data -B{0}/bin -D{0}/data".format(dest_name, key))
-                cmd("./analyze_new_cluster.sh")
 
             with get_new_node('node_%s' % dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
                 node.default_conf(log_statement='ddl')
                 node.start()
+                with node.replicate('replica', use_logging=True) as replica:
+                    for sql in sql_fillcheck:
+                        node.psql('postgres', sql)
+
+                #with cwd(rel('build')):
+                #    cmd("./analyze_new_cluster.sh", env={'PGPORT': str(node.port)})
+
                 print("run: pgbench for %s after upgrade from %s" % (dest_name, key))
-                p = node.pgbench(options=['--time', '100', '-c', '4', '-j', '8'])
+                p = node.pgbench(options=['--time', str(args.bench_time), '-c', '4', '-j', '8'])
                 p.wait()
 
                 print("run: check our tables")
