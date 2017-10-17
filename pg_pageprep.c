@@ -699,11 +699,15 @@ set_relcache_fillfactor(Oid relid)
 			rel->rd_options != NULL &&
 			(rel->rd_rel->relkind == RELKIND_RELATION ||
 			 rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
-			 rel->rd_rel->relkind == RELKIND_MATVIEW))
+			 rel->rd_rel->relkind == RELKIND_MATVIEW
+#if PG_VERSION_NUM >= 100000
+			 || rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE
+#endif
+			))
 		{
 			((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
-			elog(LOG, "runtime fillfactor set for \"%s\"",
-					generate_qualified_relation_name(relid));
+			/*elog(LOG, "runtime fillfactor set for \"%s\"",
+					generate_qualified_relation_name(relid)); */
 		}
 		RelationClose(rel);
 	}
