@@ -92,6 +92,7 @@ COPY ten FROM '{0}/input/toast.csv';
 '''
 
 sql_part = '''
+DROP TABLE IF EXISTS par CASCADE;
 CREATE TABLE par (LIKE ten) PARTITION BY RANGE (id);
 ALTER TABLE par ALTER COLUMN msg SET STORAGE EXTERNAL;
 CREATE TABLE part1 PARTITION OF par FOR VALUES FROM (0) TO (33);
@@ -130,10 +131,14 @@ def cwd(path):
         os.chdir(curdir)
 
 
-def cmd(command, env=None):
+def cmd(command, env=None, suppress_output=True):
     print("run: ", command)
     with open(os.devnull, 'w') as f:
-        subprocess.check_call(command, shell=True, env=env, stdout=f)
+        kwargs = {}
+        if suppress_output:
+            kwargs['stdout'] = f
+
+        subprocess.check_call(command, shell=True, env=env, **kwargs)
 
 
 def set_environ_for(key):
@@ -199,7 +204,7 @@ if __name__ == '__main__':
             if key == dest_name:
                 continue
 
-            with get_new_node('node_%s' % key, base_dir=prefix_dir, use_logging=True) as node:
+            with get_new_node(key, base_dir=prefix_dir, use_logging=True) as node:
                 node.default_conf(log_statement='ddl')
                 node.append_conf('postgresql.conf', addconf)
                 node.start()
@@ -251,14 +256,15 @@ if __name__ == '__main__':
                 cmd('bin/initdb -D ./data')
 
             set_environ_for(dest_name)
-            with get_new_node('node_%s' % dest_name,
+            with get_new_node(dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
                 node.default_conf(log_statement='ddl')
                 node.append_conf('postgresql.conf', addconf)
 
             dest_conf = conf[dest_name]
             with cwd(rel('build')):
-                cmd("{0}/bin/pg_upgrade -b {1}/bin -d {1}/data -B{0}/bin -D{0}/data".format(dest_name, key))
+                cmd("{0}/bin/pg_upgrade -b {1}/bin -d {1}/data -B{0}/bin -D{0}/data".format(dest_name, key),
+                        suppress_output=False)
 
             with get_new_node('%s' % dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
