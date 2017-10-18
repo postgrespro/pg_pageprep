@@ -86,9 +86,6 @@ DROP TABLE IF EXISTS ten;
 CREATE TABLE two(a tsvector) WITH (fillfactor=100);
 INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
-SELECT scan_pages('two'::REGCLASS);
-SELECT scan_pages('view_two'::REGCLASS);
-
 CREATE TABLE ten (id SERIAL, msg TEXT);
 ALTER TABLE ten ALTER COLUMN msg SET STORAGE EXTERNAL;
 COPY ten FROM '{0}/input/toast.csv';
@@ -135,7 +132,8 @@ def cwd(path):
 
 def cmd(command, env=None):
     print("run: ", command)
-    subprocess.check_call(command, shell=True, env=env)
+    with open(os.devnull, 'w') as f:
+        subprocess.check_call(command, shell=True, env=env, stdout=f)
 
 
 def set_environ_for(key):
@@ -207,9 +205,9 @@ if __name__ == '__main__':
                 node.start()
 
                 # add our testing tables
-                node.psql('postgres',  sql_fill.format(pageprep_dir))
+                assert node.psql('postgres',  sql_fill.format(pageprep_dir))[0] == 0
                 if key in part_checks:
-                    node.psql('postgres', sql_part.format(pageprep_dir))
+                    assert node.psql('postgres', sql_part.format(pageprep_dir))[0] == 0
 
                 print("run: pgbench %s before upgrade for %s seconds" % (key, args.bench_time))
                 node.pgbench_init(scale=10)

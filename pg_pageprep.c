@@ -852,8 +852,10 @@ worker_main(Datum arg)
 			rel = relation_open(relid, AccessShareLock);
 			update_fillfactor(rel);
 
+#if PG_VERSION_NUM >= 100000
 			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 				skip_relation = true;
+#endif
 
 			add_relation_to_jobs(rel);
 			relation_close(rel, AccessShareLock);
