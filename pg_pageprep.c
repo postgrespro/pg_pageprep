@@ -591,7 +591,6 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 	worker_args->idx = idx;
 	worker_args->relid = relid;
 	worker_args->async = !wait;
-	worker_args->latch_set = false;
 
 	/* Initialize worker struct */
 	memcpy(buf, dbname, sizeof(buf));
@@ -618,16 +617,18 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 	if (WaitForBackgroundWorkerStartup(bgw_handle, &pid) == BGWH_POSTMASTER_DIED)
 		elog(ERROR, "Postmaster died during bgworker startup");
 
-	while (!worker_args->latch_set)
-		/* Wait to be signalled. */
+	/* Wait to be signalled. */
 #if PG_VERSION_NUM >= 100000
-		WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
+	WaitLatch(MyLatch, WL_LATCH_SET, 0, PG_WAIT_EXTENSION);
 #else
-		WaitLatch(MyLatch, WL_LATCH_SET, 0);
+	WaitLatch(MyLatch, WL_LATCH_SET, 0);
 #endif
 
 	/* Reset the latch so we don't spin. */
 	ResetLatch(MyLatch);
+
+	if (wait)
+		WaitForBackgroundWorkerShutdown(bgw_handle);
 
 	/* Remove the segment */
 	dsm_detach(seg);
@@ -699,15 +700,9 @@ set_relcache_fillfactor(Oid relid)
 			rel->rd_options != NULL &&
 			(rel->rd_rel->relkind == RELKIND_RELATION ||
 			 rel->rd_rel->relkind == RELKIND_TOASTVALUE ||
-			 rel->rd_rel->relkind == RELKIND_MATVIEW
-#if PG_VERSION_NUM >= 100000
-			 || rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE
-#endif
-			))
+			 rel->rd_rel->relkind == RELKIND_MATVIEW))
 		{
 			((StdRdOptions *) rel->rd_options)->fillfactor = FILLFACTOR;
-			/*elog(LOG, "runtime fillfactor set for \"%s\"",
-					generate_qualified_relation_name(relid)); */
 		}
 		RelationClose(rel);
 	}
@@ -748,8 +743,7 @@ worker_main(Datum arg)
 	dsm_segment	   *seg;
 	PGPROC		   *starter;
 	Oid				worker_relid;
-	bool			async,
-					latch_set = false;
+	bool			async;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -768,15 +762,15 @@ worker_main(Datum arg)
 	worker_relid = worker_args->relid;
 	async = worker_args->async;
 
+	/* we don't need this segment anymore */
+	dsm_detach(seg);
+
 	starter = BackendPidGetProc(MyBgworkerEntry->bgw_notify_pid);
 	if (starter == NULL)
 		elog(NOTICE, "starter worker has exited prematurely");
 	else if (async)
 	{
 		/* let start other workers */
-		latch_set = true;
-		worker_args->latch_set = latch_set;
-		dsm_detach(seg);
 		SetLatch(&starter->procLatch);
 	}
 
@@ -804,6 +798,7 @@ worker_main(Datum arg)
 			Oid			relid;
 			Relation 	rel;
 			bool		interrupted;
+			bool		skip_relation = false;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -854,23 +849,40 @@ worker_main(Datum arg)
 				continue;
 			}
 
-			rel = heap_open(relid, AccessShareLock);
-			add_relation_to_jobs(rel);
+			rel = relation_open(relid, AccessShareLock);
 			update_fillfactor(rel);
 
-			elog(LOG, "pg_pageprep (%s): scanning %d pages of %s",
-				 get_database_name(MyDatabaseId),
-				 RelationGetNumberOfBlocks(rel),
-				 generate_qualified_relation_name(relid));
-			heap_close(rel, AccessShareLock);
+			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+				skip_relation = true;
+
+			add_relation_to_jobs(rel);
+			relation_close(rel, AccessShareLock);
+
+			/* we need transaction to show the messages */
+			if (!skip_relation)
+			{
+				elog(LOG, "pg_pageprep (%s): scanning %d pages of %s",
+					 get_database_name(MyDatabaseId),
+					 RelationGetNumberOfBlocks(rel),
+					 generate_qualified_relation_name(relid));
+			}
+			else
+				elog(LOG, "pg_pageprep (%s): %s relation was skipped",
+					 get_database_name(MyDatabaseId),
+					 generate_qualified_relation_name(relid));
 
 			/* Commit current transaction to apply fillfactor changes */
 			finish_xact_command();
 
 			/*
-			 * Scan relation
+			 * Scan relation if we need to
 			 */
-			scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
+			if (!skip_relation)
+				scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
+			else
+				update_status(relid, TS_DONE, 0);
+
+			skip_relation = false;
 
 			if (interrupted)
 				break;
@@ -883,23 +895,19 @@ worker_main(Datum arg)
 	}
 	PG_CATCH();
 	{
-		worker_data[MyWorkerIndex].status = WS_STOPPED;
 		elog(LOG, "pg_pageprep (%s): error occured",
 				worker_data[MyWorkerIndex].dbname);
+
+		/* worker is ending, let the starter know about it */
+		worker_data[MyWorkerIndex].status = WS_STOPPED;
+		SetLatch(&starter->procLatch);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	worker_data[MyWorkerIndex].status = WS_STOPPED;
-
 	/* worker is ending, let the starter know about it */
-	if (!latch_set)
-	{
-		latch_set = true;
-		worker_args->latch_set = latch_set;
-		dsm_detach(seg);
-		SetLatch(&starter->procLatch);
-	}
+	worker_data[MyWorkerIndex].status = WS_STOPPED;
+	SetLatch(&starter->procLatch);
 
 	elog(LOG, "pg_pageprep: worker finished its work (pid: %u) for \"%s\" database",
 			MyProcPid, worker_data[MyWorkerIndex].dbname);

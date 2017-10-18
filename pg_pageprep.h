@@ -48,7 +48,6 @@ typedef struct
 	uint32	idx;
 	Oid		relid;
 	bool	async;
-	volatile bool	latch_set;
 } WorkerArgs;
 
 /* this is beginning of DR_intorel */

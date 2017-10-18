@@ -65,6 +65,7 @@ LOG_CONFIG = {
 logging.config.dictConfig(LOG_CONFIG)
 
 dest_name = 'pgpro10_enterprise'
+part_checks = ['pgpro10_standard', 'pg10_stable']
 addconf = '''
 log_error_verbosity = 'terse'
 log_min_messages = 'info'
@@ -94,10 +95,12 @@ COPY ten FROM '{0}/input/toast.csv';
 '''
 
 sql_part = '''
-CREATE TABLE par (LIKE ten) PARTITION BY id;
-CREATE TABLE part1 (LIKE par) PARTITION OF par FOR VALUES FROM (0) TO (33);
-CREATE TABLE part2 (LIKE par) PARTITION OF par FOR VALUES FROM (33) TO (66);
-CREATE TABLE part3 (LIKE par) PARTITION OF par FOR VALUES FROM (66) TO (MAXVALUE);
+CREATE TABLE par (LIKE ten) PARTITION BY RANGE (id);
+ALTER TABLE par ALTER COLUMN msg SET STORAGE EXTERNAL;
+CREATE TABLE part1 PARTITION OF par FOR VALUES FROM (0) TO (33);
+CREATE TABLE part2 PARTITION OF par FOR VALUES FROM (33) TO (66);
+CREATE TABLE part3 PARTITION OF par FOR VALUES FROM (66) TO (MAXVALUE);
+COPY par FROM '{0}/input/toast.csv';
 '''
 
 # just read all pages
@@ -105,6 +108,10 @@ sql_fillcheck = (
     'SELECT a FROM two',
     'SELECT a FROM view_two',
     'SELECT * FROM ten',
+)
+
+sql_partcheck = (
+    'SELECT tableoid::REGCLASS, * FROM par;',
 )
 
 def rel(*args):
@@ -201,6 +208,8 @@ if __name__ == '__main__':
 
                 # add our testing tables
                 node.psql('postgres',  sql_fill.format(pageprep_dir))
+                if key in part_checks:
+                    node.psql('postgres', sql_part.format(pageprep_dir))
 
                 print("run: pgbench %s before upgrade for %s seconds" % (key, args.bench_time))
                 node.pgbench_init(scale=10)
@@ -217,6 +226,10 @@ if __name__ == '__main__':
                 # check that all is ok
                 for sql in sql_fillcheck:
                     assert node.psql('postgres', sql)[0] == 0
+
+                if key in part_checks:
+                    for sql in sql_partcheck:
+                        assert node.psql('postgres', sql)[0] == 0
 
                 p = node.pgbench(options=['--time', str(args.bench_time), '-c', '4', '-j', '8'])
                 p.wait()
@@ -270,5 +283,9 @@ if __name__ == '__main__':
                 print("run: check our tables")
                 for sql in sql_fillcheck:
                     assert node.psql('postgres', sql)[0] == 0
+
+                if key in part_checks:
+                    for sql in sql_partcheck:
+                        assert node.psql('postgres', sql)[0] == 0
 
                 node.stop()
