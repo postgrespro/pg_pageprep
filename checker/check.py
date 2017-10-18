@@ -66,6 +66,9 @@ logging.config.dictConfig(LOG_CONFIG)
 
 dest_name = 'pgpro10_enterprise'
 addconf = '''
+log_error_verbosity = 'terse'
+log_min_messages = 'info'
+
 shared_preload_libraries='pg_pageprep'
 pg_pageprep.role = '%s'
 pg_pageprep.database = 'postgres'
@@ -88,6 +91,13 @@ SELECT scan_pages('view_two'::REGCLASS);
 CREATE TABLE ten (id SERIAL, msg TEXT);
 ALTER TABLE ten ALTER COLUMN msg SET STORAGE EXTERNAL;
 COPY ten FROM '{0}/input/toast.csv';
+'''
+
+sql_part = '''
+CREATE TABLE par (LIKE ten) PARTITION BY id;
+CREATE TABLE part1 (LIKE par) PARTITION OF par FOR VALUES FROM (0) TO (33);
+CREATE TABLE part2 (LIKE par) PARTITION OF par FOR VALUES FROM (33) TO (66);
+CREATE TABLE part3 (LIKE par) PARTITION OF par FOR VALUES FROM (66) TO (MAXVALUE);
 '''
 
 # just read all pages
@@ -189,7 +199,7 @@ if __name__ == '__main__':
                 node.append_conf('postgresql.conf', addconf)
                 node.start()
 
-                # add our testing tables and start pg_pageprep
+                # add our testing tables
                 node.psql('postgres',  sql_fill.format(pageprep_dir))
 
                 print("run: pgbench %s before upgrade for %s seconds" % (key, args.bench_time))
@@ -197,9 +207,20 @@ if __name__ == '__main__':
                 p = node.pgbench(options=['--time', str(args.bench_time), '-c', '4', '-j', '8'])
                 p.wait()
 
+                for sql in sql_fillcheck:
+                    assert node.psql('postgres', sql)[0] == 0
+
                 node.psql('postgres', 'drop extension pg_pageprep;')
                 node.psql('postgres', 'create extension pg_pageprep;')
-                node.psql('postgres', 'select start_bgworker();')
+                assert node.psql('postgres', 'select start_bgworker();')[0] == 0
+
+                # check that all is ok
+                for sql in sql_fillcheck:
+                    assert node.psql('postgres', sql)[0] == 0
+
+                p = node.pgbench(options=['--time', str(args.bench_time), '-c', '4', '-j', '8'])
+                p.wait()
+
                 node.stop()
 
     if args.check_upgrade:
@@ -228,13 +249,16 @@ if __name__ == '__main__':
             with cwd(rel('build')):
                 cmd("{0}/bin/pg_upgrade -b {1}/bin -d {1}/data -B{0}/bin -D{0}/data".format(dest_name, key))
 
-            with get_new_node('node_%s' % dest_name,
+            with get_new_node('%s' % dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
-                node.default_conf(log_statement='ddl')
+                node.default_conf(log_statement='ddl', allow_streaming=True)
                 node.start()
-                with node.replicate('replica', use_logging=True) as replica:
+                with node.replicate('%s_replica' % dest_name, use_logging=True) as replica:
+                    replica.default_conf(log_statement='ddl')
+                    replica.start()
+                    replica.catchup()
                     for sql in sql_fillcheck:
-                        node.psql('postgres', sql)
+                        assert replica.psql('postgres', sql)[0] == 0
 
                 #with cwd(rel('build')):
                 #    cmd("./analyze_new_cluster.sh", env={'PGPORT': str(node.port)})
@@ -245,6 +269,6 @@ if __name__ == '__main__':
 
                 print("run: check our tables")
                 for sql in sql_fillcheck:
-                    node.psql('postgres', sql)
+                    assert node.psql('postgres', sql)[0] == 0
 
                 node.stop()
