@@ -65,11 +65,13 @@ LOG_CONFIG = {
 logging.config.dictConfig(LOG_CONFIG)
 
 dest_name = 'pgpro10_enterprise'
+skip_pageprep = 'pgpro96_enterprise'
 part_checks = ['pgpro10_standard', 'pg10_stable']
-addconf = '''
+pg_conf = '''
 log_error_verbosity = 'terse'
 log_min_messages = 'info'
-
+'''
+pg_pageprep_conf = '''
 shared_preload_libraries='pg_pageprep'
 pg_pageprep.role = '%s'
 pg_pageprep.database = 'postgres'
@@ -147,16 +149,24 @@ def set_environ_for(key):
     os.environ['USE_PGXS'] = '1'
 
 
+def init_conf(node, key):
+    node.default_conf(log_statement='ddl')
+    node.append_conf('postgresql.conf', pg_conf)
+    if key not in skip_pageprep:
+        node.append_conf('postgresql.conf', pg_pageprep_conf)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--fill-data", help="fill databases with data",
-            dest='fill_data', action='store_true')
+                        dest='fill_data', action='store_true')
     parser.add_argument("--check-upgrade", help="fill databases with data",
-            dest='check_upgrade', action='store_true')
+                        dest='check_upgrade', action='store_true')
     parser.add_argument("--branch", help="check only one branch",
-            dest='branch', default=None, action='store')
+                        dest='branch', default=None, action='store')
     parser.add_argument("--bench-time", help="time for pgbench",
-            dest='bench_time', default=60, action='store', type=int)
+                        dest='bench_time', default=60, action='store',
+                        type=int)
     args = parser.parse_args()
 
     configure_testgres(cache_initdb=False, cache_pg_config=False)
@@ -197,16 +207,16 @@ if __name__ == '__main__':
                 continue
 
             set_environ_for(key)
-            with cwd(pageprep_dir):
-                cmd('make clean', env=os.environ)
-                cmd('make install', env=os.environ)
+            if key not in skip_pageprep:
+                with cwd(pageprep_dir):
+                    cmd('make clean', env=os.environ)
+                    cmd('make install', env=os.environ)
 
             if key == dest_name:
                 continue
 
             with get_new_node(key, base_dir=prefix_dir, use_logging=True) as node:
-                node.default_conf(log_statement='ddl')
-                node.append_conf('postgresql.conf', addconf)
+                init_conf(node, key)
                 node.start()
 
                 # add our testing tables
@@ -222,9 +232,10 @@ if __name__ == '__main__':
                 for sql in sql_fillcheck:
                     assert node.psql('postgres', sql)[0] == 0
 
-                node.psql('postgres', 'drop extension pg_pageprep;')
-                node.psql('postgres', 'create extension pg_pageprep;')
-                assert node.psql('postgres', 'select start_bgworker();')[0] == 0
+                if key not in skip_pageprep:
+                    node.psql('postgres', 'drop extension pg_pageprep;')
+                    node.psql('postgres', 'create extension pg_pageprep;')
+                    assert node.psql('postgres', 'select start_bgworker();')[0] == 0
 
                 # check that all is ok
                 for sql in sql_fillcheck:
@@ -258,8 +269,7 @@ if __name__ == '__main__':
             set_environ_for(dest_name)
             with get_new_node(dest_name,
                     base_dir=rel('build', dest_name), use_logging=True) as node:
-                node.default_conf(log_statement='ddl')
-                node.append_conf('postgresql.conf', addconf)
+                init_conf(node, key)
 
             dest_conf = conf[dest_name]
             with cwd(rel('build')):
