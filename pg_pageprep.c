@@ -111,7 +111,9 @@ PG_FUNCTION_INFO_V1(get_workers_list);
 void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
+#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
 static void start_starter_process(void);
+#endif
 void starter_process_main(Datum dummy);
 static void start_bgworker_dynamic(const char *, Oid, bool);
 static int acquire_slot(const char *dbname);
@@ -150,10 +152,16 @@ _PG_init(void)
 
 	setup_guc_variables();
 
+#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
 	if (pg_pageprep_enable_workers)
 		start_starter_process();
 	else
 		elog(LOG, "pg_pageprep: workers are disabled");
+#else
+	elog(NOTICE,
+		 "pg_pageprep: workers are disabled in PostgresPro Enterise 10+. "
+		 "Use start_bgworker() if needed");
+#endif
 
 	executor_run_hook_next			= ExecutorRun_hook;
 	ExecutorRun_hook				= pageprep_executor_hook;
@@ -223,7 +231,7 @@ setup_guc_variables(void)
                             "Database name",
                             NULL,
                             &pg_pageprep_database,
-                            "",
+                            "postgres",
                             PGC_SIGHUP,
                             0,
                             NULL,
@@ -487,6 +495,7 @@ get_workers_list(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
+#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
 static void
 start_starter_process(void)
 {
@@ -510,6 +519,7 @@ start_starter_process(void)
 	/* Start dynamic worker */
 	RegisterBackgroundWorker(&worker);
 }
+#endif
 
 /*
  * Background worker whose goal is to get the list of existing databases and
