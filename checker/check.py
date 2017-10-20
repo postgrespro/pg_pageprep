@@ -65,7 +65,7 @@ LOG_CONFIG = {
 logging.config.dictConfig(LOG_CONFIG)
 
 dest_name = 'pgpro10_enterprise'
-skip_pageprep = 'pgpro96_enterprise'
+skip_pageprep = ['pgpro96_enterprise']
 part_checks = ['pgpro10_standard', 'pg10_stable']
 pg_conf = '''
 log_error_verbosity = 'terse'
@@ -84,6 +84,10 @@ pg_pageprep.per_relation_delay = 1
 sql_fill = '''
 DROP TABLE IF EXISTS two CASCADE;
 DROP TABLE IF EXISTS ten;
+DROP TABLE IF EXISTS geo;
+DROP TABLE IF EXISTS gin_test;
+DROP TABLE IF EXISTS gist_test;
+DROP TABLE IF EXISTS brin_test;
 
 CREATE TABLE two(a tsvector) WITH (fillfactor=100);
 INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
@@ -91,6 +95,15 @@ CREATE MATERIALIZED VIEW view_two AS SELECT * FROM two;
 CREATE TABLE ten (id SERIAL, msg TEXT);
 ALTER TABLE ten ALTER COLUMN msg SET STORAGE EXTERNAL;
 COPY ten FROM '{0}/input/toast.csv';
+CREATE TABLE geo AS SELECT * FROM (VALUES (1,1), (5, 5), (10, 10)) AS v(lat, lng);
+CREATE INDEX ON geo USING spgist (point(lat, lng));
+
+CREATE TABLE gin_test AS SELECT * FROM (VALUES ('one'), ('two'), ('three')) as v(str);
+CREATE INDEX ON gin_test USING gin (to_tsvector('english', str));
+CREATE TABLE gist_test AS SELECT * FROM (VALUES ('one'), ('two'), ('three')) as v(str);
+CREATE INDEX ON gist_test USING gist (to_tsvector('english', str));
+CREATE TABLE brin_test AS SELECT generate_series(1, 1000) as id;
+CREATE INDEX ON brin_test USING brin (id);
 '''
 
 sql_part = '''
@@ -108,6 +121,10 @@ sql_fillcheck = (
     'SELECT a FROM two',
     'SELECT a FROM view_two',
     'SELECT * FROM ten',
+    'SET enable_seqscan = off; SELECT * FROM geo WHERE point(lat, lng) << point(5,5)',
+    'SET enable_seqscan = off; SELECT * FROM gin_test WHERE to_tsvector(\'english\', str) @@ to_tsquery(\'english\', \'one\')',
+    'SET enable_seqscan = off; SELECT * FROM gist_test WHERE to_tsvector(\'english\', str) @@ to_tsquery(\'english\', \'one\');',
+    'SET enable_seqscan = off; SELECT * FROM brin_test WHERE id = 123;'
 )
 
 sql_partcheck = (
