@@ -41,10 +41,10 @@ You can add the following parameters to your postgres config:
 ## Python script
 
 ```
-python manager.py -d <database_list> -U <username> <command>
+python manager.py -d <database> -U <username> <command>
 ```
 
-where `<database_list>` is a comma-separated list of databases, `<username>` is a user name on whose behalf the script will work and `command` is one of the following:
+where `<database>` is a database used to get the list of all databases in cluster, `<username>` is a user name on whose behalf the script will work and `command` is one of the following:
 
 * install - creates extension on each existing database, sets pg_pageprep.databases and pg_pageprep.role parameters to config (ALTER SYSTEM). Note that background workers will start automatically after next cluster restart.
 * start - starts background workers right away;
