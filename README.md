@@ -4,7 +4,7 @@
 
 `pg_pageprep` is an extension that is supposed to help to prepare heap pages for migration to 64bit XID page format.
 
-PostgresPro Enterprise page format reqiures extra 24 bytes per page compared to original PostgreSQL in order to support 64bit transaction IDs. The idea behind this extension is to prepare enough space in pages for new format while database is working on vanilla postgres.
+PostgresPro Enterprise page format reqiures extra 20 bytes per page compared to original PostgreSQL in order to support 64bit transaction IDs. The idea behind this extension is to prepare enough space in pages for new format while database is working on vanilla postgres.
 
 # Installation
 
@@ -47,7 +47,7 @@ python manager.py -d <database> -U <username> <command>
 where `<database>` is a database used to get the list of all databases in cluster, `<username>` is a user name on whose behalf the script will work and `command` is one of the following:
 
 * install - creates extension on each existing database, sets pg_pageprep.databases and pg_pageprep.role parameters to config (ALTER SYSTEM). Note that background workers will start automatically after next cluster restart.
-* start - starts background workers right away;
+* start - starts background workers right away; note that during its works background worker sets fillfactor to 90% (if needed) for every relation it processes;
 * stop - stops background workers;
 * status - shows information about current workers activity and relations to be processed;
 * restore - stop workers (if any) and restore original fillfactor (this is usually need to be done once after pg_upgrade).
@@ -63,13 +63,14 @@ python manager.py -d postgres -U my_username status
 
 ## plpgsql
 
-Perform on every database in cluster:
+Perform on every database in cluster.
 
 ```
 CREATE EXTENSION pg_pageprep;
 SELECT start_bgworker();
 ```
 
+Note that during its works background worker sets fillfactor to 90% (if needed) for every relation it processes.
 To check todo list use `pg_pageprep_todo` view:
 
 ```
@@ -92,7 +93,12 @@ SELECT * FROM get_workers_list();
 Use following function to stop background worker:
 
 ```
-SELECT start_bgworker();
+SELECT stop_bgworker();
 ```
 
 This only stops worker on current database.
+After pg_upgrade run the following command to restore fillfactors to original values:
+
+```
+SELECT restore_fillfactors()
+```
