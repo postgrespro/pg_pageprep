@@ -56,6 +56,7 @@ PG_MODULE_MAGIC;
 #define NEEDED_SPACE_SIZE 28
 #define FILLFACTOR 90
 #define MAX_WORKERS 100
+#define MyWorker worker_data[MyWorkerIndex]
 
 /*
  * TODOs:
@@ -785,21 +786,21 @@ worker_main(Datum arg)
 	}
 
 	elog(LOG, "pg_pageprep: worker is started (pid: %u) for \"%s\" database",
-			MyProcPid, worker_data[MyWorkerIndex].dbname);
+			MyProcPid, MyWorker.dbname);
 
-	if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+	if (MyWorker.status == WS_STOPPING)
 	{
-		worker_data[MyWorkerIndex].status = WS_STOPPED;
+		MyWorker.status = WS_STOPPED;
 		return;
 	}
 
-	worker_data[MyWorkerIndex].pid = MyProcPid;
-	worker_data[MyWorkerIndex].status = WS_ACTIVE;
+	MyWorker.pid = MyProcPid;
+	MyWorker.status = WS_ACTIVE;
 
 	PG_TRY();
 	{
 		/* Establish connection and start transaction */
-		BackgroundWorkerInitializeConnection(worker_data[MyWorkerIndex].dbname,
+		BackgroundWorkerInitializeConnection(MyWorker.dbname,
 											 pg_pageprep_role);
 
 		/* Iterate through relations */
@@ -813,7 +814,7 @@ worker_main(Datum arg)
 			CHECK_FOR_INTERRUPTS();
 
 			/* User sent stop signal */
-			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+			if (MyWorker.status == WS_STOPPING)
 			{
 				/*
 				 * TODO: Set latch or something instead and wait until user decides
@@ -821,10 +822,10 @@ worker_main(Datum arg)
 				 */
 				elog(LOG, "pg_pageprep: worker has been stopped (pid: %u)",
 					 MyProcPid);
-				worker_data[MyWorkerIndex].status = WS_STOPPED;
+				MyWorker.status = WS_STOPPED;
 				break;
 			}
-			worker_data[MyWorkerIndex].status = WS_ACTIVE;
+			MyWorker.status = WS_ACTIVE;
 
 			start_xact_command();
 
@@ -833,9 +834,9 @@ worker_main(Datum arg)
 				Oid schema = get_extension_schema();
 				if (!OidIsValid(schema))
 					elog(ERROR, "extension is not installed in \"%s\" database",
-							worker_data[MyWorkerIndex].dbname);
+							MyWorker.dbname);
 
-				worker_data[MyWorkerIndex].ext_schema = schema;
+				MyWorker.ext_schema = schema;
 				SPI_finish();
 			}
 			else elog(ERROR, "SPI initialization error");
@@ -854,7 +855,7 @@ worker_main(Datum arg)
 					break;
 				}
 
-				worker_data[MyWorkerIndex].status = WS_IDLE;
+				MyWorker.status = WS_IDLE;
 				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
 				continue;
 			}
@@ -908,21 +909,21 @@ worker_main(Datum arg)
 	PG_CATCH();
 	{
 		elog(LOG, "pg_pageprep (%s): error occured",
-				worker_data[MyWorkerIndex].dbname);
+				MyWorker.dbname);
 
 		/* worker is ending, let the starter know about it */
-		worker_data[MyWorkerIndex].status = WS_STOPPED;
+		MyWorker.status = WS_STOPPED;
 		SetLatch(&starter->procLatch);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	/* worker is ending, let the starter know about it */
-	worker_data[MyWorkerIndex].status = WS_STOPPED;
+	MyWorker.status = WS_STOPPED;
 	SetLatch(&starter->procLatch);
 
 	elog(LOG, "pg_pageprep: worker finished its work (pid: %u) for \"%s\" database",
-			MyProcPid, worker_data[MyWorkerIndex].dbname);
+			MyProcPid, MyWorker.dbname);
 }
 
 /*
@@ -936,9 +937,9 @@ get_extension_schema(void)
 {
 	Oid res = InvalidOid;
 
-	if (OidIsValid(worker_data[MyWorkerIndex].ext_schema))
+	if (OidIsValid(MyWorker.ext_schema))
 	{
-		return worker_data[MyWorkerIndex].ext_schema;
+		return MyWorker.ext_schema;
 	}
 	else
 	{
@@ -1011,6 +1012,8 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 	bool		has_skipped_pages = false;
 	char		*relname = NULL;
 	char		*dbname = NULL;
+	instr_time	instr_starttime;
+	instr_time	instr_currenttime;
 
 	MemoryContext	oldcontext;
 	MemoryContext	tmpctx = AllocSetContextCreate(CurrentMemoryContext,
@@ -1047,10 +1050,11 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 				}
 			}
 
+			INSTR_TIME_SET_CURRENT(instr_starttime);
 retry_block:
 			CHECK_FOR_INTERRUPTS();
 
-			if (worker_data[MyWorkerIndex].status == WS_STOPPING)
+			if (MyWorker.status == WS_STOPPING)
 			{
 				*interrupted = true;
 				break;
@@ -1151,6 +1155,19 @@ next_tuple:
 next_block:
 			ReleaseBuffer(buf);
 			blkno++;
+
+			/* Instrumentation */
+			INSTR_TIME_SET_CURRENT(instr_currenttime);
+			INSTR_TIME_SUBTRACT(instr_currenttime, instr_starttime);
+
+			/* Calculate average time per page */
+			if (MyWorker.avg_time_per_page)
+				MyWorker.avg_time_per_page =
+					MyWorker.avg_time_per_page / 2
+					+ INSTR_TIME_GET_MICROSEC(instr_currenttime) / 2;
+			else
+				MyWorker.avg_time_per_page =
+					INSTR_TIME_GET_MICROSEC(instr_currenttime);
 
 			if (reopen_relation)
 				heap_close(rel, RowExclusiveLock);

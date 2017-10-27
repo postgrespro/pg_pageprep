@@ -32,7 +32,7 @@ returns void as 'MODULE_PATHNAME', 'scan_pages_pl'
 language c strict;
 
 
-create or replace function start_bgworker()
+create or replace function start_bgworker(wait boolean default false)
 returns void as 'MODULE_PATHNAME', 'start_bgworker'
 language c strict;
 

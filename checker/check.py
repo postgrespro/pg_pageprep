@@ -250,9 +250,17 @@ if __name__ == '__main__':
                     assert node.psql('postgres', sql)[0] == 0
 
                 if key not in skip_pageprep:
-                    node.psql('postgres', 'drop extension pg_pageprep;')
-                    node.psql('postgres', 'create extension pg_pageprep;')
-                    assert node.psql('postgres', 'select start_bgworker();')[0] == 0
+                    with node.replicate('%s_replica' % key, use_logging=True) as repl:
+                        repl.default_conf(log_statement='ddl')
+                        init_conf(repl, key)
+                        repl.start()
+
+                        node.psql('postgres', 'drop extension pg_pageprep;')
+                        node.psql('postgres', 'create extension pg_pageprep;')
+                        repl.catchup()
+                        assert node.psql('postgres', 'select start_bgworker();')[0] == 0
+
+                        repl.catchup()
 
                 # check that all is ok
                 for sql in sql_fillcheck:
