@@ -57,13 +57,18 @@ PG_MODULE_MAGIC;
 #define FILLFACTOR 90
 #define MAX_WORKERS 100
 #define MyWorker worker_data[MyWorkerIndex]
+#define RING_BUFFER_SIZE 10
 
-/*
- * TODOs:
- * 1. lock buffer while we are moving tuples
- * 2. handle invalidation messages
- * 3. set fillfactor - done
- */
+typedef struct
+{
+	uint64	values[RING_BUFFER_SIZE];
+	uint8	pos;
+} RingBuffer;
+
+static void RingBufferInit(RingBuffer *rb);
+static void RingBufferInsert(RingBuffer *rb, uint64 value);
+static uint64 RingBufferAvg(RingBuffer *rb);
+
 int MyWorkerIndex = 0;
 
 static int pg_pageprep_per_page_delay = 0;
@@ -74,6 +79,7 @@ static bool pg_pageprep_enable_workers = true;
 static bool pg_pageprep_enable_runtime_fillfactor = true;
 static char *pg_pageprep_role = NULL;
 static Worker *worker_data;
+static RingBuffer est_buffer;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
 
@@ -100,6 +106,7 @@ planner_hook_type				planner_hook_next = NULL;
 /*
  * PL funcs
  */
+PG_FUNCTION_INFO_V1(estimate_time);
 PG_FUNCTION_INFO_V1(scan_pages_pl);
 PG_FUNCTION_INFO_V1(start_bgworker);
 PG_FUNCTION_INFO_V1(stop_bgworker);
@@ -112,7 +119,7 @@ PG_FUNCTION_INFO_V1(get_workers_list);
 void _PG_init(void);
 static void setup_guc_variables(void);
 static void pg_pageprep_shmem_startup_hook(void);
-#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
+#if !(PG_VERSION_NUM >= 100000 && defined(PGPRO_EE))
 static void start_starter_process(void);
 #endif
 void starter_process_main(Datum dummy);
@@ -153,7 +160,7 @@ _PG_init(void)
 
 	setup_guc_variables();
 
-#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
+#if !(PG_VERSION_NUM >= 100000 && defined(PGPRO_EE))
 	if (pg_pageprep_enable_workers)
 		start_starter_process();
 	else
@@ -305,6 +312,18 @@ handle_sigterm(SIGNAL_ARGS)
 }
 
 static void
+sleep_interruptible(long milliseconds)
+{
+	int i;
+	int seconds = milliseconds / 1000;
+
+	for (i = 0; i < seconds; i++)
+		pg_usleep(1000L);	/* one second */
+
+	pg_usleep((milliseconds % 1000) * 1000L);
+}
+
+static void
 start_xact_command(void)
 {
 	if (IsTransactionState())
@@ -336,6 +355,51 @@ finish_xact_command(void)
 	}
 }
 
+/*
+ * estimate_time
+ *		Return estimate time based on total pages count, delays and average
+ *		processing time per page
+ */
+Datum
+estimate_time(PG_FUNCTION_ARGS)
+{
+	uint64	estimate = 0;
+	int		idx = find_database_slot(get_database_name(MyDatabaseId));
+
+	if (SPI_connect() == SPI_OK_CONNECT)
+	{
+		char *query;
+
+		query = psprintf("SELECT count(1), sum(relpages) "
+						 "FROM %s.pg_pageprep_todo todo "
+						 "JOIN pg_class c on todo.oid = c.oid",
+						 get_namespace_name(get_extension_schema()));
+
+		if (SPI_exec(query, 0) != SPI_OK_SELECT)
+			elog(ERROR, "pg_pageprep: failed to get total pages count");
+
+		if (SPI_processed > 0)
+		{
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			HeapTuple	tuple = SPI_tuptable->vals[0];
+			uint32		total_rels;
+			uint32		total_pages;
+			bool		isnull;
+
+			total_rels = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+			total_pages = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
+
+			estimate = total_rels * pg_pageprep_per_relation_delay * 1000L
+				+ total_pages * pg_pageprep_per_page_delay * 1000L
+				+ total_pages * worker_data[idx].avg_time_per_page;
+		}
+		pfree(query);
+	}
+	SPI_finish();
+
+	PG_RETURN_INT64(estimate / 1000);
+}
+
 Datum
 scan_pages_pl(PG_FUNCTION_ARGS)
 {
@@ -358,7 +422,8 @@ scan_pages_pl(PG_FUNCTION_ARGS)
 Datum
 start_bgworker(PG_FUNCTION_ARGS)
 {
-	int idx = find_database_slot(get_database_name(MyDatabaseId));
+	bool	wait = PG_GETARG_BOOL(0);
+	int		idx = find_database_slot(get_database_name(MyDatabaseId));
 
 	if (idx >= 0)
 	{
@@ -379,7 +444,7 @@ start_bgworker(PG_FUNCTION_ARGS)
 		}
 	}
 
-	start_bgworker_dynamic(NULL, InvalidOid, true);
+	start_bgworker_dynamic(NULL, InvalidOid, wait);
 	PG_RETURN_VOID();
 }
 
@@ -496,7 +561,7 @@ get_workers_list(PG_FUNCTION_ARGS)
 	SRF_RETURN_DONE(funcctx);
 }
 
-#if PG_VERSION_NUM < 100000 && defined(PGPRO_EE)
+#if !(PG_VERSION_NUM >= 100000 && defined(PGPRO_EE))
 static void
 start_starter_process(void)
 {
@@ -772,6 +837,7 @@ worker_main(Datum arg)
 	MyWorkerIndex = worker_args->idx;
 	worker_relid = worker_args->relid;
 	async = worker_args->async;
+	RingBufferInit(&est_buffer);
 
 	/* we don't need this segment anymore */
 	dsm_detach(seg);
@@ -796,6 +862,7 @@ worker_main(Datum arg)
 
 	MyWorker.pid = MyProcPid;
 	MyWorker.status = WS_ACTIVE;
+	MyWorker.avg_time_per_page = 0;
 
 	PG_TRY();
 	{
@@ -856,7 +923,7 @@ worker_main(Datum arg)
 				}
 
 				MyWorker.status = WS_IDLE;
-				pg_usleep(pg_pageprep_per_attempt_delay * 1000L);
+				sleep_interruptible(pg_pageprep_per_attempt_delay);
 				continue;
 			}
 
@@ -903,7 +970,7 @@ worker_main(Datum arg)
 			if (OidIsValid(worker_relid))
 				break;
 
-			pg_usleep(pg_pageprep_per_relation_delay * 1000L);
+			sleep_interruptible(pg_pageprep_per_relation_delay);
 		}
 	}
 	PG_CATCH();
@@ -1159,20 +1226,14 @@ next_block:
 			/* Instrumentation */
 			INSTR_TIME_SET_CURRENT(instr_currenttime);
 			INSTR_TIME_SUBTRACT(instr_currenttime, instr_starttime);
-
-			/* Calculate average time per page */
-			if (MyWorker.avg_time_per_page)
-				MyWorker.avg_time_per_page =
-					MyWorker.avg_time_per_page / 2
-					+ INSTR_TIME_GET_MICROSEC(instr_currenttime) / 2;
-			else
-				MyWorker.avg_time_per_page =
-					INSTR_TIME_GET_MICROSEC(instr_currenttime);
+			RingBufferInsert(&est_buffer,
+							 INSTR_TIME_GET_MICROSEC(instr_currenttime));
+			MyWorker.avg_time_per_page = RingBufferAvg(&est_buffer);
 
 			if (reopen_relation)
 				heap_close(rel, RowExclusiveLock);
 
-			pg_usleep(pg_pageprep_per_page_delay * 1000L);
+			sleep_interruptible(pg_pageprep_per_page_delay);
 		}
 
 		heap_close(rel, RowExclusiveLock);
@@ -1774,4 +1835,37 @@ pageprep_planner_hook(Query *parse, int cursorOptions, ParamListInfo boundParams
 		result = standard_planner(parse, cursorOptions, boundParams);
 
 	return result;
+}
+
+static void
+RingBufferInit(RingBuffer *rb)
+{
+	int i = 0;
+
+	for (i = 0; i < RING_BUFFER_SIZE; i++)
+		rb->values[i] = 0;
+	rb->pos = 0;
+}
+
+static void
+RingBufferInsert(RingBuffer *rb, uint64 value)
+{
+	rb->values[rb->pos++] = value;
+}
+
+static uint64
+RingBufferAvg(RingBuffer *rb)
+{
+	int		i = 0;
+	uint64	total = 0;
+
+	/*
+	 * TODO: its not the best way to calculate average value because of
+	 * the possibility of overflow
+	 */
+	for (i = 0; i < RING_BUFFER_SIZE; i++)
+		total += rb->values[i];
+
+	total /= RING_BUFFER_SIZE;
+	return total;
 }

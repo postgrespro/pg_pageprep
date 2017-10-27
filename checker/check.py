@@ -258,7 +258,7 @@ if __name__ == '__main__':
                         node.psql('postgres', 'drop extension pg_pageprep;')
                         node.psql('postgres', 'create extension pg_pageprep;')
                         repl.catchup()
-                        assert node.psql('postgres', 'select start_bgworker();')[0] == 0
+                        assert node.psql('postgres', 'select start_bgworker(true);')[0] == 0
 
                         repl.catchup()
 

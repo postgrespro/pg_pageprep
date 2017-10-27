@@ -42,6 +42,11 @@ returns void as 'MODULE_PATHNAME', 'stop_bgworker'
 language c strict;
 
 
+create or replace function estimate_time()
+returns bigint as 'MODULE_PATHNAME', 'estimate_time'
+language c strict;
+
+
 create or replace function get_workers_list()
 returns table (pid integer, database text, status text)
 as 'MODULE_PATHNAME', 'get_workers_list'
