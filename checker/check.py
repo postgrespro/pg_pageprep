@@ -14,22 +14,28 @@ configure_cmd = 'CFLAGS="-g3 -O0" ./configure --prefix=%s --enable-depend --enab
 
 conf = {
     'pg96_stable': {
-        'branch': 'REL9_6_STABLE',
+        'branch': 'REL9_6_STABLE',      # git branch
+        'collate': 'en_US.UTF-8@libc'   # default collation
     },
     'pg10_stable': {
         'branch': 'REL_10_STABLE',
+        'collate': 'en_US.UTF-8@libc'
     },
     'pgpro96_standard': {
         'branch': 'PGPRO9_6',
+        'collate': 'en_US.UTF-8@icu'
     },
     'pgpro10_standard': {
         'branch': 'PGPRO10',
+        'collate': 'en_US.UTF-8@libc'
     },
     'pgpro96_enterprise': {
         'branch': 'PGPROEE9_6',
+        'collate': 'en_US.UTF-8@icu'
     },
     'pgpro10_enterprise': {
         'branch': 'PGPROEE10_pg_upgrade',
+        'collate': 'en_US.UTF-8@icu'
     }
 }
 
@@ -209,7 +215,10 @@ if __name__ == '__main__':
 
         with cwd(pgpro_dir):
             cmd('git clean -fdx && git checkout %s' % options['branch'])
-            cmd(configure_cmd % prefix_dir)
+            configure = configure_cmd
+            if key == dest_name:
+                configure = configure + ' --with-icu'
+            cmd(configure % prefix_dir)
             cmd('make install -j10')
 
         with cwd(prefix_dir):
@@ -289,7 +298,7 @@ if __name__ == '__main__':
 
             with cwd(rel('build', dest_name)):
                 cmd('rm -rf ./data')
-                cmd('bin/initdb -D ./data')
+                cmd('bin/initdb -D ./data --lc-collate={}'.format(options['collate']))
 
             set_environ_for(dest_name)
             with get_new_node(dest_name,
@@ -309,6 +318,7 @@ if __name__ == '__main__':
                     replica.default_conf(log_statement='ddl')
                     replica.start()
                     replica.catchup()
+                    import pdb; pdb.set_trace()
                     for sql in sql_fillcheck:
                         assert replica.psql('postgres', sql)[0] == 0
 

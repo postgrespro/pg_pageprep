@@ -318,7 +318,7 @@ sleep_interruptible(long milliseconds)
 	int seconds = milliseconds / 1000;
 
 	for (i = 0; i < seconds; i++)
-		pg_usleep(1000L);	/* one second */
+		pg_usleep(1000000L);	/* one second */
 
 	pg_usleep((milliseconds % 1000) * 1000L);
 }
@@ -1531,27 +1531,22 @@ get_pageprep_schema(void)
 static void
 update_status(Oid relid, TaskStatus status, int updated)
 {
-	Snapshot		snapshot;
-	HeapTuple		htup,
-					oldtup = NULL,
-					newtup;
-	HeapScanDesc	scan;
-	Relation		rel;
+	Snapshot	snapshot;
+	HeapTuple	htup,
+				oldtup = NULL,
+				newtup;
+	HeapScanDesc scan;
+	Relation	rel;
+	Oid			jobs_relid = InvalidOid;
 
 	Datum		values[4];
 	bool		nulls[4];
 	bool		replaces[4];
 
-	static Oid	jobs_relid = InvalidOid;
-
 	start_xact_command();
 
-	if (!OidIsValid(jobs_relid))
-	{
-		jobs_relid = get_relname_relid("pg_pageprep_jobs", get_pageprep_schema());
-		Assert(OidIsValid(jobs_relid));
-	}
-
+	jobs_relid = get_relname_relid("pg_pageprep_jobs", get_pageprep_schema());
+	Assert(OidIsValid(jobs_relid));
 	rel = heap_open(jobs_relid, AccessShareLock);
 	snapshot = RegisterSnapshot(GetLatestSnapshot());
 	scan = heap_beginscan(rel, snapshot, 0, NULL);
