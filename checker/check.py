@@ -318,7 +318,6 @@ if __name__ == '__main__':
                     replica.default_conf(log_statement='ddl')
                     replica.start()
                     replica.catchup()
-                    import pdb; pdb.set_trace()
                     for sql in sql_fillcheck:
                         assert replica.psql('postgres', sql)[0] == 0
 
