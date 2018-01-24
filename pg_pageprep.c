@@ -318,7 +318,12 @@ sleep_interruptible(long milliseconds)
 	int seconds = milliseconds / 1000;
 
 	for (i = 0; i < seconds; i++)
+	{
+		if (InterruptPending)
+			break;
+
 		pg_usleep(1000000L);	/* one second */
+	}
 
 	pg_usleep((milliseconds % 1000) * 1000L);
 }
