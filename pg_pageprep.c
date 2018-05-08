@@ -167,7 +167,7 @@ _PG_init(void)
 		elog(LOG, "pg_pageprep: workers are disabled");
 #else
 	elog(NOTICE,
-		 "pg_pageprep: workers are disabled in PostgresPro Enterprise 10+. "
+		 "pg_pageprep: workers are disabled in Postgres Pro Enterprise 10 or higher. "
 		 "Use start_bgworker() if needed");
 #endif
 
