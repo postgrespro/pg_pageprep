@@ -1,0 +1,4 @@
+shared_preload_libraries='pg_pageprep'
+pg_pageprep.enable_workers=off
+pg_pageprep.role='test'
+

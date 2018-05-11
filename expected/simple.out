@@ -10,6 +10,10 @@ SHOW pg_pageprep.enable_workers;
 /* minimal delays */
 SET pg_pageprep.per_relation_delay=0;
 SET pg_pageprep.per_page_delay=0;
+CREATE FUNCTION show_reloptions(rel regclass) RETURNS text[] AS
+$$
+	SELECT reloptions FROM pg_class WHERE oid = rel;
+$$ LANGUAGE sql;
 CREATE EXTENSION pg_pageprep;
 CREATE VIEW todo_list AS
 	SELECT regexp_replace(relname::text, '\d+'::text, '0') as rel1, status
@@ -28,12 +32,11 @@ SELECT * FROM todo_list;
 (2 rows)
 
 INSERT INTO one SELECT i FROM generate_series(1, 1000) i;
-\d+ one
-                         Table "public.one"
- Column |  Type   | Modifiers | Storage | Stats target | Description 
---------+---------+-----------+---------+--------------+-------------
- a      | integer |           | plain   |              | 
-Options: fillfactor=100
+SELECT show_reloptions('one');
+ show_reloptions  
+------------------
+ {fillfactor=100}
+(1 row)
 
 SELECT scan_pages('one'::regclass);
 NOTICE:  fillfactor was updated for "public.one"
@@ -43,12 +46,11 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (page
  
 (1 row)
 
-\d+ one
-                         Table "public.one"
- Column |  Type   | Modifiers | Storage | Stats target | Description 
---------+---------+-----------+---------+--------------+-------------
- a      | integer |           | plain   |              | 
-Options: fillfactor=90
+SELECT show_reloptions('one');
+ show_reloptions 
+-----------------
+ {fillfactor=90}
+(1 row)
 
 SELECT * FROM todo_list;
     rel1    | status 

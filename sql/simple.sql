@@ -9,6 +9,11 @@ SHOW pg_pageprep.enable_workers;
 SET pg_pageprep.per_relation_delay=0;
 SET pg_pageprep.per_page_delay=0;
 
+CREATE FUNCTION show_reloptions(rel regclass) RETURNS text[] AS
+$$
+	SELECT reloptions FROM pg_class WHERE oid = rel;
+$$ LANGUAGE sql;
+
 CREATE EXTENSION pg_pageprep;
 CREATE VIEW todo_list AS
 	SELECT regexp_replace(relname::text, '\d+'::text, '0') as rel1, status
@@ -22,9 +27,9 @@ CREATE VIEW jobs_list AS
 CREATE TABLE one(a INT4) WITH (fillfactor=100);
 SELECT * FROM todo_list;
 INSERT INTO one SELECT i FROM generate_series(1, 1000) i;
-\d+ one
+SELECT show_reloptions('one');
 SELECT scan_pages('one'::regclass);
-\d+ one
+SELECT show_reloptions('one');
 SELECT * FROM todo_list;
 SELECT * FROM jobs_list;
 
