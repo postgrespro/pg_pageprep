@@ -1,4 +1,5 @@
 \set verbosity terse
+CREATE USER test SUPERUSER LOGIN;
 /* should be off for testing */
 SHOW pg_pageprep.enable_workers;
  pg_pageprep.enable_workers 
@@ -139,7 +140,7 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (page
 (1 row)
 
 /* nothing to do */
-SELECT start_bgworker();
+SELECT start_bgworker(true);
  start_bgworker 
 ----------------
  
@@ -160,7 +161,7 @@ SELECT * FROM todo_list;
 (4 rows)
 
 /* should scan 'three' and 'view_three' */
-SELECT start_bgworker();
+SELECT start_bgworker(true);
  start_bgworker 
 ----------------
  
@@ -174,11 +175,11 @@ SELECT * FROM todo_list;
 SELECT * FROM jobs_list;
         rel1         | fillfactor | status | updated 
 ---------------------+------------+--------+---------
- pg_toast.pg_toast_0 |        100 | done   |       0
- three               |        100 | done   |       8
- pg_toast.pg_toast_0 |        100 | done   |       0
- view_three          |        100 | done   |       8
- pg_toast.pg_toast_0 |        100 | done   |       0
+ pg_toast.pg_toast_0 |         90 | done   |       0
+ three               |         90 | done   |       8
+ pg_toast.pg_toast_0 |         90 | done   |       0
+ view_three          |         90 | done   |       8
+ pg_toast.pg_toast_0 |         90 | done   |       0
 (5 rows)
 
 DROP TABLE three CASCADE;
@@ -186,3 +187,4 @@ NOTICE:  drop cascades to materialized view view_three
 DROP VIEW todo_list;
 DROP VIEW jobs_list;
 DROP EXTENSION pg_pageprep;
+DROP USER test;

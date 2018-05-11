@@ -1,5 +1,7 @@
 \set verbosity terse
 
+CREATE USER test SUPERUSER LOGIN;
+
 /* should be off for testing */
 SHOW pg_pageprep.enable_workers;
 
@@ -49,7 +51,7 @@ INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 SELECT scan_pages('two'::REGCLASS);
 
 /* nothing to do */
-SELECT start_bgworker();
+SELECT start_bgworker(true);
 
 DROP TABLE two CASCADE;
 
@@ -59,7 +61,7 @@ CREATE MATERIALIZED VIEW view_three AS SELECT * FROM three;
 SELECT * FROM todo_list;
 
 /* should scan 'three' and 'view_three' */
-SELECT start_bgworker();
+SELECT start_bgworker(true);
 SELECT * FROM todo_list;
 SELECT * FROM jobs_list;
 
@@ -68,3 +70,5 @@ DROP TABLE three CASCADE;
 DROP VIEW todo_list;
 DROP VIEW jobs_list;
 DROP EXTENSION pg_pageprep;
+
+DROP USER test;

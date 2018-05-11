@@ -709,7 +709,10 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 	ResetLatch(MyLatch);
 
 	if (wait)
-		WaitForBackgroundWorkerShutdown(bgw_handle);
+	{
+		if (WaitForBackgroundWorkerShutdown(bgw_handle) != BGWH_STOPPED)
+			elog(WARNING, "pg_pageprep (%s): WaitForBackgroundWorkerShutdown() failed", buf);
+	}
 
 	/* Remove the segment */
 	dsm_detach(seg);

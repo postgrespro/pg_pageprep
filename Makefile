@@ -4,6 +4,7 @@ DATA = pg_pageprep--0.1.sql
 
 OBJS = pg_pageprep.o
 REGRESS = simple toast
+EXTRA_REGRESS_OPTS=--temp-config=$(top_srcdir)/$(subdir)/conf.add
 
 ifdef USE_PGXS
 ifndef PG_CONFIG
