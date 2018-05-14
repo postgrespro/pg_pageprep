@@ -1853,6 +1853,8 @@ RingBufferInit(RingBuffer *rb)
 static void
 RingBufferInsert(RingBuffer *rb, uint64 value)
 {
+	if (rb->pos >= RING_BUFFER_SIZE)
+		rb->pos = 0;
 	rb->values[rb->pos++] = value;
 }
 
