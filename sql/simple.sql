@@ -1,6 +1,9 @@
 \set verbosity terse
 
 CREATE USER test SUPERUSER LOGIN;
+CREATE DATABASE pg_pageprep_regression;
+\set prevdb :DBNAME
+\c pg_pageprep_regression
 
 /* should be off for testing */
 SHOW pg_pageprep.enable_workers;
@@ -76,4 +79,6 @@ DROP VIEW todo_list;
 DROP VIEW jobs_list;
 DROP EXTENSION pg_pageprep;
 
+\c :prevdb
+DROP DATABASE pg_pageprep_regression;
 DROP USER test;

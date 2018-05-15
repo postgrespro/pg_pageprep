@@ -1,5 +1,8 @@
 \set verbosity terse
 CREATE USER test SUPERUSER LOGIN;
+CREATE DATABASE pg_pageprep_regression;
+\set prevdb :DBNAME
+\c pg_pageprep_regression
 /* should be off for testing */
 SHOW pg_pageprep.enable_workers;
  pg_pageprep.enable_workers 
@@ -40,7 +43,7 @@ SELECT show_reloptions('one');
 
 SELECT scan_pages('one'::regclass);
 NOTICE:  fillfactor was updated for "public.one"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -66,7 +69,7 @@ SELECT * FROM jobs_list;
 
 /* should be zero updated */
 SELECT scan_pages('one'::regclass);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.one (pages scanned: 5, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -88,7 +91,7 @@ SELECT * FROM todo_list;
 
 SELECT scan_pages('two'::REGCLASS);
 NOTICE:  fillfactor was updated for "public.two"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 8)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 8)
  scan_pages 
 ------------
  
@@ -96,7 +99,7 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (page
 
 SELECT scan_pages('view_two'::REGCLASS);
 NOTICE:  fillfactor was updated for "public.view_two"
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 8)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 8)
  scan_pages 
 ------------
  
@@ -119,14 +122,14 @@ SELECT * FROM jobs_list;
 
 /* should be zeros */
 SELECT scan_pages('two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 0)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.two (pages scanned: 9, tuples moved: 0)
  scan_pages 
 ------------
  
 (1 row)
 
 SELECT scan_pages('view_two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 0)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.view_two (pages scanned: 9, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -135,7 +138,7 @@ NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.view_two 
 INSERT INTO two SELECT 'a:1 b:2 c:3'::tsvector FROM generate_series(1, 1000) i;
 /* should be still zero */
 SELECT scan_pages('two'::REGCLASS);
-NOTICE:  pg_pageprep (contrib_regression): finish page scan for public.two (pages scanned: 18, tuples moved: 0)
+NOTICE:  pg_pageprep (pg_pageprep_regression): finish page scan for public.two (pages scanned: 18, tuples moved: 0)
  scan_pages 
 ------------
  
@@ -189,4 +192,6 @@ NOTICE:  drop cascades to materialized view view_three
 DROP VIEW todo_list;
 DROP VIEW jobs_list;
 DROP EXTENSION pg_pageprep;
+\c :prevdb
+DROP DATABASE pg_pageprep_regression;
 DROP USER test;
