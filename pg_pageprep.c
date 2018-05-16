@@ -83,9 +83,9 @@ static RingBuffer est_buffer;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static bool xact_started = false;
 
-ExecutorRun_hook_type	executor_run_hook_next = NULL;
-post_parse_analyze_hook_type	post_parse_analyze_hook_next = NULL;
-planner_hook_type				planner_hook_next = NULL;
+static ExecutorRun_hook_type		executor_run_hook_next = NULL;
+static post_parse_analyze_hook_type	post_parse_analyze_hook_next = NULL;
+static planner_hook_type			planner_hook_next = NULL;
 
 #define EXTENSION_QUERY "SELECT extnamespace FROM pg_extension WHERE extname = 'pg_pageprep'"
 
@@ -1810,7 +1810,8 @@ pageprep_post_parse_analyze_hook(ParseState *pstate, Query *query)
 	{
 		Relation	rel;
 
-		if (IsA(query->utilityStmt, CopyStmt))
+		if (IsA(query->utilityStmt, CopyStmt) &&
+			((CopyStmt *) query->utilityStmt)->relation)
 		{
 			CopyStmt	*stmt;
 			stmt = (CopyStmt *) query->utilityStmt;
