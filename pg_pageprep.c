@@ -1736,7 +1736,8 @@ our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	foreach(lc, into->options)
 	{
 		def = (DefElem *) lfirst(lc);
-		if (strcmp(def->defnamespace, "toast") == 0)
+		if (def->defnamespace &&
+			strcmp(def->defnamespace, "toast") == 0)
 			count++;
 	}
 
