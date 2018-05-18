@@ -714,6 +714,12 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 			elog(WARNING, "pg_pageprep (%s): WaitForBackgroundWorkerShutdown() failed", buf);
 	}
 
+	/*
+	 * TODO: this is just a temporary workaround; should use latch to make
+	 * sure that child process has already attached to the segment.
+	 */
+	sleep_interruptible(5*1000);
+
 	/* Remove the segment */
 	dsm_detach(seg);
 
@@ -839,6 +845,8 @@ worker_main(Datum arg)
 	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_pageprep");
 
 	seg = dsm_attach((dsm_handle) DatumGetInt32(arg));
+	if (!seg)
+		elog(ERROR, "pg_pageprep: cannot attach to dynamic shared memory segment");
 	worker_args = (WorkerArgs *) dsm_segment_address(seg);
 
 	/* keep the arguments */
