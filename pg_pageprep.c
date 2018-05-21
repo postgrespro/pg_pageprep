@@ -1723,8 +1723,17 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 static void (*orig_intorel_startup)
 	(DestReceiver *self, int operation, TupleDesc typeinfo) = NULL;
 
+/*
+ * Returns MemoryContext for the specified pointer. See GetMemoryChunkContext()
+ * for details.
+ */
+#if PG_VERSION_NUM >= 100000
 #define PointerMemoryContext(pointer) \
 	(*(MemoryContext *) (((char *) pointer) - sizeof(void *)))
+#else
+#define PointerMemoryContext(pointer) \
+	(GetMemoryChunkContext(pointer))
+#endif
 
 static void
 our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
