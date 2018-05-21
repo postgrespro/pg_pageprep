@@ -674,7 +674,7 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 	worker_args->async = !wait;
 
 	/* Initialize worker struct */
-	memcpy(buf, dbname, sizeof(buf));
+	StrNCpy(buf, dbname, sizeof(buf));
 	snprintf(worker.bgw_name, BGW_MAXLEN,
 			 "pg_pageprep (%s)", buf);
 	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
