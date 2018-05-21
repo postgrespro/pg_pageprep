@@ -1723,6 +1723,9 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 static void (*orig_intorel_startup)
 	(DestReceiver *self, int operation, TupleDesc typeinfo) = NULL;
 
+#define PointerMemoryContext(pointer) \
+	(*(MemoryContext *) (((char *) pointer) - sizeof(void *)))
+
 static void
 our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 {
@@ -1745,9 +1748,11 @@ our_intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 	{
 		/*
 		 * we just add one parameter to make that reloptions will be created
-		 * and we can fill fillfactor at relcache hook
+		 * and we can fill fillfactor at relcache hook. We use memory context
+		 * of the IntoClause since this plan could be cached and hense
+		 * transaction memory context won't be available anymore.
 		 */
-		oldcontext = MemoryContextSwitchTo(MessageContext);
+		oldcontext = MemoryContextSwitchTo(PointerMemoryContext(into));
 #if PG_VERSION_NUM >= 100000
 		def = makeDefElemExtended("toast", "autovacuum_enabled", NULL, DEFELEM_SET, -1);
 #else
