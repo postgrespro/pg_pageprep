@@ -573,9 +573,10 @@ start_starter_process(void)
 	BackgroundWorker	worker;
 
 	/* Initialize worker struct */
+	memset(&worker, 0, sizeof(worker));
 	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep starter");
-	memcpy(worker.bgw_function_name, CppAsString(starter_process_main), BGW_MAXLEN);
-	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, CppAsString(starter_process_main));
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_pageprep");
 
 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
@@ -675,10 +676,10 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 
 	/* Initialize worker struct */
 	StrNCpy(buf, dbname, sizeof(buf));
-	snprintf(worker.bgw_name, BGW_MAXLEN,
-			 "pg_pageprep (%s)", buf);
-	memcpy(worker.bgw_function_name, CppAsString(worker_main), BGW_MAXLEN);
-	memcpy(worker.bgw_library_name, "pg_pageprep", BGW_MAXLEN);
+	memset(&worker, 0, sizeof(worker));
+	snprintf(worker.bgw_name, BGW_MAXLEN, "pg_pageprep (%s)", buf);
+	snprintf(worker.bgw_function_name, BGW_MAXLEN, CppAsString(worker_main));
+	snprintf(worker.bgw_library_name, BGW_MAXLEN, "pg_pageprep");
 
 	worker.bgw_flags			= BGWORKER_SHMEM_ACCESS |
 									BGWORKER_BACKEND_DATABASE_CONNECTION;
