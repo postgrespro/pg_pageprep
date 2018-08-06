@@ -658,7 +658,7 @@ start_bgworker_dynamic(const char *dbname, Oid relid, bool wait)
 	BackgroundWorkerHandle *bgw_handle;
 	pid_t		pid;
 	int			idx;
-	char		buf[64];
+	char		buf[50];	/* BGW_MAXLEN - sizeof("pg_pageprep ()") */
 
 	dsm_segment		*seg;
 	WorkerArgs		*worker_args;
@@ -893,7 +893,7 @@ worker_main(Datum arg)
 			Oid			relid;
 			Relation 	rel;
 			bool		interrupted;
-			bool		skip_relation = false;
+			bool		skip_relation;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -947,6 +947,7 @@ worker_main(Datum arg)
 			rel = relation_open(relid, AccessShareLock);
 			update_fillfactor(rel);
 
+			skip_relation = false;
 #if PG_VERSION_NUM >= 100000
 			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 				skip_relation = true;
@@ -974,12 +975,11 @@ worker_main(Datum arg)
 			/*
 			 * Scan relation if we need to
 			 */
+			interrupted = false;
 			if (!skip_relation)
 				scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
 			else
 				update_status(relid, TS_DONE, 0);
-
-			skip_relation = false;
 
 			if (interrupted)
 				break;
