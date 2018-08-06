@@ -1,0 +1,2 @@
+pg_pageprep.enable_workers=off
+pg_pageprep.role='test'

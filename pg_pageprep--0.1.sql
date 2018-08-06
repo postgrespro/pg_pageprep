@@ -123,6 +123,6 @@ begin
 	loop
 		perform __update_fillfactor(row.rel, row.fillfactor);
 	end loop;
-end	
+end
 $$
 language plpgsql;

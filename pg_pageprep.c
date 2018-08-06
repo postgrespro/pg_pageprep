@@ -165,11 +165,6 @@ _PG_init(void)
 		start_starter_process();
 	else
 		elog(LOG, "pg_pageprep: workers are disabled");
-#else
-	elog(NOTICE,
-		 "pg_pageprep: workers are disabled in Postgres Pro Enterprise 10 or higher. "
-		 "Use start_bgworker() if needed");
-#endif
 
 	executor_run_hook_next			= ExecutorRun_hook;
 	ExecutorRun_hook				= pageprep_executor_hook;
@@ -179,6 +174,11 @@ _PG_init(void)
 
 	planner_hook_next				= planner_hook;
 	planner_hook					= pageprep_planner_hook;
+#else
+	elog(NOTICE,
+		 "pg_pageprep: workers are disabled in Postgres Pro Enterprise 10 or higher. "
+		 "Use start_bgworker() if needed");
+#endif
 }
 
 static void
