@@ -618,7 +618,7 @@ starter_process_main(Datum dummy)
 	}
 
 	/* Establish connection and start transaction */
-	BackgroundWorkerInitializeConnection(pg_pageprep_database,
+	BackgroundWorkerInitializeConnectionCompat(pg_pageprep_database,
 										 pg_pageprep_role);
 
 	start_xact_command();
@@ -884,7 +884,7 @@ worker_main(Datum arg)
 	PG_TRY();
 	{
 		/* Establish connection and start transaction */
-		BackgroundWorkerInitializeConnection(MyWorker.dbname,
+		BackgroundWorkerInitializeConnectionCompat(MyWorker.dbname,
 											 pg_pageprep_role);
 
 		/* Iterate through relations */
@@ -1485,7 +1485,7 @@ update_indexes(Relation rel, HeapTuple tuple)
 		estate->es_range_table = list_make1(rte);
 
 
-		slot = MakeTupleTableSlot();
+		slot = MakeTupleTableSlotCompat();
 		ExecSetSlotDescriptor(slot, tupdesc);
 		ExecStoreTuple(tuple, slot, InvalidBuffer, false);
 
@@ -1711,7 +1711,7 @@ print_tuple(TupleDesc tupdesc, HeapTuple tuple)
 {
 	TupleTableSlot *slot;
 
-	slot = MakeTupleTableSlot();
+	slot = MakeTupleTableSlotCompat();
 	ExecSetSlotDescriptor(slot, tupdesc);
 	slot->tts_isempty = false;
 	slot->tts_tuple = tuple;

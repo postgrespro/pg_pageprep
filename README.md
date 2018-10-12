@@ -5,9 +5,13 @@
 
 **WIP**
 
-`pg_pageprep` is an extension that is supposed to help to prepare heap pages for migration to 64bit XID page format.
+`pg_pageprep` is an extension that is supposed to help to prepare heap pages
+for migration to 64bit XID page format.
 
-PostgresPro Enterprise page format reqiures extra 20 bytes per page compared to original PostgreSQL in order to support 64bit transaction IDs. The idea behind this extension is to prepare enough space in pages for new format while database is working on vanilla postgres.
+PostgresPro Enterprise page format reqiures extra 20 bytes per page compared
+to original PostgreSQL in order to support 64bit transaction IDs. The idea
+behind this extension is to prepare enough space in pages for new format
+while database is working on vanilla postgres.
 
 # Installation
 

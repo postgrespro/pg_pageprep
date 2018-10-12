@@ -80,6 +80,28 @@ void pageprep_executor_hook(QueryDesc *queryDesc,
 						   ExecutorRun_CountArgType count);
 #endif
 
+/*
+ * BackgroundWorkerInitializeConnectionByOid()
+ */
+#if PG_VERSION_NUM >= 110000
+#define BackgroundWorkerInitializeConnectionCompat(dbname, useroid) \
+	BackgroundWorkerInitializeConnection((dbname), (useroid), 0)
+#else
+#define BackgroundWorkerInitializeConnectionCompat(dbname, useroid) \
+	BackgroundWorkerInitializeConnection((dbname), (useroid))
+#endif
+
+/*
+ * MakeTupleTableSlot()
+ */
+#if PG_VERSION_NUM >= 110000
+#define MakeTupleTableSlotCompat() \
+	MakeTupleTableSlot(NULL)
+#else
+#define MakeTupleTableSlotCompat() \
+	MakeTupleTableSlot()
+#endif
+
 void pageprep_post_parse_analyze_hook(ParseState *pstate, Query *query);
 PlannedStmt *pageprep_planner_hook(Query *parse, int cursorOptions,
 		ParamListInfo boundParams);
