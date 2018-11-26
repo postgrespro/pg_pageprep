@@ -11,7 +11,7 @@ ifndef PG_CONFIG
 PG_CONFIG = pg_config
 endif
 
-MK_PGPRO_EDITION = $(shell $(PG_CONFIG) --pgpro-edition)
+MK_PGPRO_EDITION = $(shell $(PG_CONFIG) --pgpro-edition 2>/dev/null)
 ifeq (${MK_PGPRO_EDITION},enterprise)
 REGRESS = enterprise
 EXTRA_REGRESS_OPTS=--temp-config=$(top_srcdir)/$(subdir)/conf-ent.add

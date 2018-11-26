@@ -10,31 +10,44 @@ import argparse
 from testgres import get_new_node, configure_testgres
 
 current_dir = os.path.abspath(os.path.dirname(__file__))
-configure_cmd = 'CFLAGS="-g3 -O0" ./configure --prefix=%s --enable-depend --enable-cassert --enable-debug --enable-tap-tests'
+configure_cmd = 'CFLAGS="-g3 -O0 -DRANDOMIZE_ALLOCATED_MEMORY -Wno-format-truncation" ./configure --prefix=%s --enable-depend --enable-cassert --enable-debug --enable-tap-tests'
 
+# All branches we're going to work with.
 conf = {
-    'pg96_stable': {
+    'pg96': {
         'branch': 'REL9_6_STABLE',      # git branch
         'collate': 'en_US.UTF-8@libc'   # default collation
     },
-    'pg10_stable': {
+    'pg10': {
         'branch': 'REL_10_STABLE',
         'collate': 'en_US.UTF-8@libc'
     },
-    'pgpro96_standard': {
+    'pg11': {
+        'branch': 'REL_11_STABLE',
+        'collate': 'en_US.UTF-8@libc'
+    },
+    'pg96_std': {
         'branch': 'PGPRO9_6',
         'collate': 'en_US.UTF-8@icu'
     },
-    'pgpro10_standard': {
+    'pg10_std': {
         'branch': 'PGPRO10',
         'collate': 'en_US.UTF-8@libc'
     },
-    'pgpro96_enterprise': {
-        'branch': 'PGPROEE9_6',
-        'collate': 'en_US.UTF-8@icu'
+    'pg11_std': {
+        'branch': 'PGPRO11',
+        'collate': 'en_US.UTF-8@libc'
     },
-    'pgpro10_enterprise': {
-        'branch': 'PGPROEE10_pg_upgrade',
+    #'pgpro96_enterprise': {
+    #    'branch': 'PGPROEE9_6',
+    #    'collate': 'en_US.UTF-8@icu'
+    #},
+    #'pgpro10_enterprise': {
+    #    'branch': 'PGPROEE10',
+    #    'collate': 'en_US.UTF-8@icu'
+    #},
+    'ee11': {
+        'branch': 'PGPROEE11_heap_convert',
         'collate': 'en_US.UTF-8@icu'
     }
 }
@@ -70,9 +83,9 @@ LOG_CONFIG = {
 }
 logging.config.dictConfig(LOG_CONFIG)
 
-dest_name = 'pgpro10_enterprise'
+dest_name = 'ee11'
 skip_pageprep = ['pgpro96_enterprise']
-part_checks = ['pgpro10_standard', 'pg10_stable']
+part_checks = ['pg10_std', 'pg10', 'pg11', 'pg11_std']
 pg_conf = '''
 log_error_verbosity = 'terse'
 log_min_messages = 'info'
@@ -181,9 +194,9 @@ def init_conf(node, key):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fill-data", help="fill databases with data",
+    parser.add_argument("-F", "--fill-data", help="fill databases with data",
                         dest='fill_data', action='store_true')
-    parser.add_argument("--check-upgrade", help="fill databases with data",
+    parser.add_argument("-U", "--upgrade", help="fill databases with data",
                         dest='check_upgrade', action='store_true')
     parser.add_argument("--branch", help="check only one branch",
                         dest='branch', default=None, action='store')
@@ -192,7 +205,8 @@ if __name__ == '__main__':
                         type=int)
     args = parser.parse_args()
 
-    configure_testgres(cache_initdb=False, cache_pg_config=False)
+    configure_testgres(cache_initdb=False, cache_pg_config=False,
+            use_python_logging=True)
 
     build_dir = rel('build')
     if not os.path.exists(build_dir):
@@ -224,6 +238,16 @@ if __name__ == '__main__':
         with cwd(prefix_dir):
             cmd('bin/initdb -D %s' % data_dir)
 
+    for key, options in conf.items():
+        if args.branch and key != args.branch and key != dest_name:
+            continue
+
+        set_environ_for(key)
+        if key not in skip_pageprep:
+            with cwd(pageprep_dir):
+                cmd('make clean', env=os.environ)
+                cmd('make install', env=os.environ)
+
     # pgbench -i, and pg_upgrade
     if args.fill_data:
         for key, options in conf.items():
@@ -232,16 +256,11 @@ if __name__ == '__main__':
             if args.branch and key != args.branch and key != dest_name:
                 continue
 
-            set_environ_for(key)
-            if key not in skip_pageprep:
-                with cwd(pageprep_dir):
-                    cmd('make clean', env=os.environ)
-                    cmd('make install', env=os.environ)
-
             if key == dest_name:
                 continue
 
-            with get_new_node(key, base_dir=prefix_dir, use_logging=True) as node:
+            set_environ_for(key)
+            with get_new_node(key, base_dir=prefix_dir) as node:
                 init_conf(node, key)
                 node.start()
 
@@ -259,7 +278,7 @@ if __name__ == '__main__':
                     assert node.psql('postgres', sql)[0] == 0
 
                 if key not in skip_pageprep:
-                    with node.replicate('%s_replica' % key, use_logging=True) as repl:
+                    with node.replicate('%s_replica' % key) as repl:
                         repl.default_conf(log_statement='ddl')
                         init_conf(repl, key)
                         repl.start()
@@ -289,10 +308,6 @@ if __name__ == '__main__':
             if key == dest_name:
                 continue
 
-            #TODO: remove these two lines when icu error will be fixed
-            if key == 'pgpro10_standard':
-                continue
-
             if args.branch and key != args.branch:
                 continue
 
@@ -302,7 +317,7 @@ if __name__ == '__main__':
 
             set_environ_for(dest_name)
             with get_new_node(dest_name,
-                    base_dir=rel('build', dest_name), use_logging=True) as node:
+                    base_dir=rel('build', dest_name)) as node:
                 init_conf(node, key)
 
             dest_conf = conf[dest_name]
@@ -311,10 +326,10 @@ if __name__ == '__main__':
                         suppress_output=False)
 
             with get_new_node('%s' % dest_name,
-                    base_dir=rel('build', dest_name), use_logging=True) as node:
+                    base_dir=rel('build', dest_name)) as node:
                 node.default_conf(log_statement='ddl', allow_streaming=True)
                 node.start()
-                with node.replicate('%s_replica' % dest_name, use_logging=True) as replica:
+                with node.replicate('%s_replica' % dest_name) as replica:
                     replica.default_conf(log_statement='ddl')
                     replica.start()
                     replica.catchup()
