@@ -23,7 +23,8 @@ CREATE VIEW todo_list AS
 	FROM pg_pageprep_todo
 	ORDER BY relname;
 CREATE VIEW jobs_list AS
-	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor,
+		status, updated, can_upgrade_table(rel)
 	FROM pg_pageprep_jobs
 	ORDER BY rel;
 

@@ -13,7 +13,8 @@ SET pg_pageprep.per_page_delay=0;
 SET pg_pageprep.enable_runtime_fillfactor=off;
 CREATE EXTENSION pg_pageprep;
 CREATE VIEW jobs_list AS
-	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor, status, updated
+	SELECT regexp_replace(rel::text, '\d+'::text, '0') as rel1, fillfactor,
+		status, updated, can_upgrade_table(rel)
 	FROM pg_pageprep_jobs
 	ORDER BY rel;
 CREATE TABLE ten (id SERIAL, msg TEXT);
@@ -26,11 +27,11 @@ SELECT start_bgworker(true);
 (1 row)
 
 SELECT * FROM jobs_list;
-        rel1         | fillfactor | status | updated 
----------------------+------------+--------+---------
- pg_toast.pg_toast_0 |         90 | done   |       0
- ten                 |         90 | done   |       0
- pg_toast.pg_toast_0 |         90 | done   |       1
+        rel1         | fillfactor | status | updated | can_upgrade_table 
+---------------------+------------+--------+---------+-------------------
+ pg_toast.pg_toast_0 |            | done   |       0 | t
+ ten                 |            | done   |       0 | t
+ pg_toast.pg_toast_0 |            | done   |       1 | t
 (3 rows)
 
 SET pg_pageprep.enable_runtime_fillfactor=on;
@@ -43,11 +44,11 @@ SELECT start_bgworker(true);
 (1 row)
 
 SELECT * FROM jobs_list;
-        rel1         | fillfactor | status | updated 
----------------------+------------+--------+---------
- pg_toast.pg_toast_0 |         90 | done   |       0
- ten                 |         90 | done   |       0
- pg_toast.pg_toast_0 |         90 | done   |       0
+        rel1         | fillfactor | status | updated | can_upgrade_table 
+---------------------+------------+--------+---------+-------------------
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
+ ten                 |         90 | done   |       0 | t
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
 (3 rows)
 
 CREATE TABLE eleven AS SELECT * FROM ten;
@@ -58,13 +59,13 @@ SELECT start_bgworker(true);
 (1 row)
 
 SELECT * FROM jobs_list;
-        rel1         | fillfactor | status | updated 
----------------------+------------+--------+---------
- pg_toast.pg_toast_0 |         90 | done   |       0
- ten                 |         90 | done   |       0
- pg_toast.pg_toast_0 |         90 | done   |       0
- eleven              |         90 | done   |       1
- pg_toast.pg_toast_0 |         90 | done   |       0
+        rel1         | fillfactor | status | updated | can_upgrade_table 
+---------------------+------------+--------+---------+-------------------
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
+ ten                 |         90 | done   |       0 | t
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
+ eleven              |            | done   |       1 | t
+ pg_toast.pg_toast_0 |            | done   |       0 | t
 (5 rows)
 
 DROP TABLE eleven;
@@ -87,11 +88,11 @@ SELECT start_bgworker(true);
 (1 row)
 
 SELECT * FROM jobs_list;
-        rel1         | fillfactor | status | updated 
----------------------+------------+--------+---------
- pg_toast.pg_toast_0 |         90 | done   |       0
- thirteen            |         90 | done   |       0
- pg_toast.pg_toast_0 |         90 | done   |       0
+        rel1         | fillfactor | status | updated | can_upgrade_table 
+---------------------+------------+--------+---------+-------------------
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
+ thirteen            |         90 | done   |       0 | t
+ pg_toast.pg_toast_0 |         90 | done   |       0 | t
 (3 rows)
 
 DROP VIEW jobs_list;

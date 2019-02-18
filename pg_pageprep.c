@@ -53,7 +53,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define NEEDED_SPACE_SIZE 28
+#define NEEDED_SPACE_SIZE ((size_t) 28)
 #define FILLFACTOR 90
 #define MAX_WORKERS 100
 #define MyWorker worker_data[MyWorkerIndex]
@@ -111,6 +111,7 @@ PG_FUNCTION_INFO_V1(scan_pages_pl);
 PG_FUNCTION_INFO_V1(start_bgworker);
 PG_FUNCTION_INFO_V1(stop_bgworker);
 PG_FUNCTION_INFO_V1(get_workers_list);
+PG_FUNCTION_INFO_V1(can_upgrade_table);
 
 
 /*
@@ -137,11 +138,16 @@ static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
 static bool update_heap_tuple(Relation rel, ItemPointer lp, HeapTuple tuple);
 static void update_indexes(Relation rel, HeapTuple tuple);
 static void update_status(Oid relid, TaskStatus status, int updated);
-static void add_relation_to_jobs(Relation rel);
-static void update_fillfactor(Relation);
+static void add_relation_to_jobs(Oid rel);
 static char *generate_qualified_relation_name(Oid relid);
 static void print_tuple(TupleDesc tupdesc, HeapTuple tuple);
 
+static void
+check_SPI_connect()
+{
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "could not initialize SPI");
+}
 
 void
 _PG_init(void)
@@ -370,36 +376,35 @@ estimate_time(PG_FUNCTION_ARGS)
 {
 	uint64	estimate = 0;
 	int		idx = find_database_slot(get_database_name(MyDatabaseId));
+	char	*query;
 
-	if (SPI_connect() == SPI_OK_CONNECT)
+	check_SPI_connect();
+
+	query = psprintf("SELECT count(1), sum(relpages) "
+					 "FROM %s.pg_pageprep_todo todo "
+					 "JOIN pg_class c on todo.oid = c.oid",
+					 get_namespace_name(get_extension_schema()));
+
+	if (SPI_exec(query, 0) != SPI_OK_SELECT)
+		elog(ERROR, "pg_pageprep: failed to get total pages count");
+
+	if (SPI_processed > 0)
 	{
-		char *query;
+		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		uint32		total_rels;
+		uint32		total_pages;
+		bool		isnull;
 
-		query = psprintf("SELECT count(1), sum(relpages) "
-						 "FROM %s.pg_pageprep_todo todo "
-						 "JOIN pg_class c on todo.oid = c.oid",
-						 get_namespace_name(get_extension_schema()));
+		total_rels = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
+		total_pages = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
 
-		if (SPI_exec(query, 0) != SPI_OK_SELECT)
-			elog(ERROR, "pg_pageprep: failed to get total pages count");
-
-		if (SPI_processed > 0)
-		{
-			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-			HeapTuple	tuple = SPI_tuptable->vals[0];
-			uint32		total_rels;
-			uint32		total_pages;
-			bool		isnull;
-
-			total_rels = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-			total_pages = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 2, &isnull));
-
-			estimate = total_rels * pg_pageprep_per_relation_delay * 1000L
-				+ total_pages * pg_pageprep_per_page_delay * 1000L
-				+ total_pages * worker_data[idx].avg_time_per_page;
-		}
-		pfree(query);
+		estimate = total_rels * pg_pageprep_per_relation_delay * 1000L
+						+ total_pages * pg_pageprep_per_page_delay * 1000L
+						+ total_pages * worker_data[idx].avg_time_per_page;
 	}
+
+	pfree(query);
 	SPI_finish();
 
 	PG_RETURN_INT64(estimate / 1000);
@@ -408,17 +413,85 @@ estimate_time(PG_FUNCTION_ARGS)
 Datum
 scan_pages_pl(PG_FUNCTION_ARGS)
 {
-	Relation	rel;
 	Oid			relid = PG_GETARG_OID(0);
 	bool		interrupted;
 
-	rel = heap_open(relid, NoLock);
-	add_relation_to_jobs(rel);
-	update_fillfactor(rel);
-	heap_close(rel, NoLock);
+	add_relation_to_jobs(relid);
 
 	scan_pages_internal(relid, &interrupted);
 	PG_RETURN_VOID();
+}
+
+/*
+ * Check whether all pages of the table have enough free space to convert
+ * them to 64-bit xids.
+ *
+ * Tuples that can be vacuumed are included in free space.
+ */
+Datum
+can_upgrade_table(PG_FUNCTION_ARGS)
+{
+	Oid relid = PG_GETARG_OID(0);
+	Relation rel;
+	bool result = true;
+
+#ifdef PGPRO_EE
+	elog(ERROR, "This function is supposed to be run before upgrade to the Enterprise edition.");
+#endif
+
+	rel = heap_open(relid, AccessShareLock);
+	for (int blkno = 1; blkno < RelationGetNumberOfBlocks(rel); blkno++)
+	{
+		CHECK_FOR_INTERRUPTS();
+		Buffer buf = ReadBuffer(rel, blkno);
+
+		Assert(BufferIsValid(buf));
+		if (!BufferIsValid(buf))
+			continue;
+
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		Page page = BufferGetPage(buf);
+		PageHeader header = (PageHeader) page;
+
+		size_t free_space = header->pd_upper - header->pd_lower;
+
+		/*
+		 * As a first check find a difference between pd_lower and pg_upper.
+		 * If it is at least equal to NEEDED_SPACE_SIZE or greater then we're
+		 * done
+		 */
+		if (free_space < NEEDED_SPACE_SIZE)
+		{
+			size_t beforeVacuum = free_space;
+			/*
+			 * Check if there are some dead or redundant tuples which could
+			 * be removed to free enough space for new page format
+			 */
+			if (!can_remove_old_tuples(rel, buf, blkno, &free_space))
+			{
+				result = false;
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ReleaseBuffer(buf);
+				elog(LOG, "not enough space for upgrade on page %u of %s (needs %lu, have %lu before vacuum, %lu after vacuum)\n",
+					 blkno, generate_qualified_relation_name(relid),
+					 NEEDED_SPACE_SIZE, beforeVacuum, free_space);
+				break;
+			}
+			elog(LOG, "enough space for upgrade on page %u of %s (needs %lu, have %lu before vacuum, %lu after vacuum)\n",
+				 blkno, generate_qualified_relation_name(relid),
+				 NEEDED_SPACE_SIZE, beforeVacuum, free_space);
+		}
+		else
+			elog(LOG, "enough space for upgrade on page %u of %s (needs %lu, have %lu)\n",
+				 blkno, generate_qualified_relation_name(relid),
+				 NEEDED_SPACE_SIZE, free_space);
+
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buf);
+	}
+	heap_close(rel, AccessShareLock);
+
+	PG_RETURN_BOOL(result);
 }
 
 /*
@@ -600,6 +673,8 @@ start_starter_process(void)
 void
 starter_process_main(Datum dummy)
 {
+	int i;
+
 	elog(LOG, "pg_pageprep: starter process (pid: %u)", MyProcPid);
 
 	/* Establish signal handlers before unblocking signals */
@@ -623,27 +698,24 @@ starter_process_main(Datum dummy)
 
 	start_xact_command();
 
-	if (SPI_connect() == SPI_OK_CONNECT)
+	check_SPI_connect();
+
+	if (SPI_exec("SELECT datname FROM pg_database", 0) != SPI_OK_SELECT)
+		elog(ERROR, "pg_pageprep: failed to get databases list");
+
+	if (SPI_processed > 0)
 	{
-		int		i;
-
-		if (SPI_exec("SELECT datname FROM pg_database", 0) != SPI_OK_SELECT)
-			elog(ERROR, "pg_pageprep: failed to get databases list");
-
-		if (SPI_processed > 0)
+		for (i = 0; i < SPI_processed; i++)
 		{
-			for (i = 0; i < SPI_processed; i++)
-			{
-				TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-				HeapTuple	tuple = SPI_tuptable->vals[i];
-				char	   *dbname;
+			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+			HeapTuple	tuple = SPI_tuptable->vals[i];
+			char	   *dbname;
 
-				dbname = SPI_getvalue(tuple, tupdesc, 1);
-				if (strcmp(dbname, "template0") == 0)
-					continue;
+			dbname = SPI_getvalue(tuple, tupdesc, 1);
+			if (strcmp(dbname, "template0") == 0)
+				continue;
 
-				start_bgworker_dynamic(dbname, InvalidOid, false);
-			}
+			start_bgworker_dynamic(dbname, InvalidOid, false);
 		}
 	}
 
@@ -890,10 +962,9 @@ worker_main(Datum arg)
 		/* Iterate through relations */
 		while (true)
 		{
+			Oid			schema;
 			Oid			relid;
-			Relation 	rel;
 			bool		interrupted;
-			bool		skip_relation;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -913,17 +984,14 @@ worker_main(Datum arg)
 
 			start_xact_command();
 
-			if (SPI_connect() == SPI_OK_CONNECT)
-			{
-				Oid schema = get_extension_schema();
-				if (!OidIsValid(schema))
-					elog(ERROR, "extension is not installed in \"%s\" database",
-							MyWorker.dbname);
+			check_SPI_connect();
+			schema = get_extension_schema();
+			if (!OidIsValid(schema))
+				elog(ERROR, "extension is not installed in \"%s\" database",
+						MyWorker.dbname);
 
-				MyWorker.ext_schema = schema;
-				SPI_finish();
-			}
-			else elog(ERROR, "SPI initialization error");
+			MyWorker.ext_schema = schema;
+			SPI_finish();
 
 			if (OidIsValid(worker_relid))
 				relid = worker_relid;
@@ -944,43 +1012,12 @@ worker_main(Datum arg)
 				continue;
 			}
 
-			rel = relation_open(relid, AccessShareLock);
-			update_fillfactor(rel);
+			add_relation_to_jobs(relid);
 
-			skip_relation = false;
-#if PG_VERSION_NUM >= 100000
-			if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-				skip_relation = true;
-#endif
-
-			add_relation_to_jobs(rel);
-			relation_close(rel, AccessShareLock);
-
-			/* we need transaction to show the messages */
-			if (!skip_relation)
-			{
-				elog(LOG, "pg_pageprep (%s): scanning %d pages of %s",
-					 get_database_name(MyDatabaseId),
-					 RelationGetNumberOfBlocks(rel),
-					 generate_qualified_relation_name(relid));
-			}
-			else
-				elog(LOG, "pg_pageprep (%s): %s relation was skipped",
-					 get_database_name(MyDatabaseId),
-					 generate_qualified_relation_name(relid));
-
-			/* Commit current transaction to apply fillfactor changes */
 			finish_xact_command();
 
-			/*
-			 * Scan relation if we need to
-			 */
 			interrupted = false;
-			if (!skip_relation)
-				scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
-			else
-				update_status(relid, TS_DONE, 0);
-
+			scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
 			if (interrupted)
 				break;
 
@@ -1048,38 +1085,35 @@ static Oid
 get_next_relation(void)
 {
 	Datum		relid = InvalidOid;
+	char *query;
+	char *namespace;
 
-	if (SPI_connect() == SPI_OK_CONNECT)
+	check_SPI_connect();
+
+	namespace = get_namespace_name(get_extension_schema());
+	query = psprintf("SELECT * FROM %s.pg_pageprep_todo", namespace);
+
+	if (SPI_exec(query, 0) != SPI_OK_SELECT)
+		elog(ERROR, "pg_pageprep::get_next_relation() failed");
+
+	/* At least one relation needs to be processed */
+	if (SPI_processed > 0)
 	{
-		char *query;
-		char *namespace = get_namespace_name(get_extension_schema());
+		bool		isnull;
+		Datum		datum;
 
-		query = psprintf("SELECT * FROM %s.pg_pageprep_todo", namespace);
+		datum = SPI_getbinval(SPI_tuptable->vals[0],
+						SPI_tuptable->tupdesc,
+						1,
+						&isnull);
+		if (isnull)
+			elog(ERROR, "pg_pageprep::get_next_relation(): relid is NULL");
 
-		if (SPI_exec(query, 0) != SPI_OK_SELECT)
-			elog(ERROR, "pg_pageprep::get_next_relation() failed");
-
-		/* At least one relation needs to be processed */
-		if (SPI_processed > 0)
-		{
-			bool		isnull;
-			Datum		datum;
-
-			datum = SPI_getbinval(SPI_tuptable->vals[0],
-								  SPI_tuptable->tupdesc,
-								  1,
-								  &isnull);
-			if (isnull)
-				elog(ERROR, "pg_pageprep::get_next_relation(): relid is NULL");
-
-			relid = DatumGetObjectId(datum);
-		}
-
-		pfree(query);
-		SPI_finish();
+		relid = DatumGetObjectId(datum);
 	}
-	else
-		elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
+
+	pfree(query);
+	SPI_finish();
 
 	return relid;
 }
@@ -1098,9 +1132,14 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 	char		*dbname = NULL;
 	instr_time	instr_starttime;
 	instr_time	instr_currenttime;
+	MemoryContext oldcontext;
+	MemoryContext tmpctx;
 
-	MemoryContext	oldcontext;
-	MemoryContext	tmpctx = AllocSetContextCreate(CurrentMemoryContext,
+#ifdef PGPRO_EE
+	elog(ERROR, "This function is supposed to be run before upgrade to the Enterprise edition.");
+#endif
+
+	tmpctx = AllocSetContextCreate(CurrentMemoryContext,
 											  "relation scan context",
 											  ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(tmpctx);
@@ -1125,12 +1164,16 @@ scan_pages_internal(Datum relid_datum, bool *interrupted)
 
 				rel = heap_open(relid, RowExclusiveLock);
 				reopen_relation = false;
+
 				if (dbname == NULL)
 				{
 					MemoryContext	cur = MemoryContextSwitchTo(tmpctx);
 					dbname = get_database_name(MyDatabaseId);
 					relname = generate_qualified_relation_name(relid);
 					MemoryContextSwitchTo(cur);
+
+					elog(LOG, "pg_pageprep (%s): scanning %d pages of %s",
+					 dbname, RelationGetNumberOfBlocks(rel), relname);
 				}
 			}
 
@@ -1189,6 +1232,10 @@ retry_block:
 					HeapTuple		tuple;
 					HeapTuple		new_tuple;
 					OffsetNumber	offnum = FirstOffsetNumber;
+
+					elog(LOG, "%s blkno=%u: not enough space after vacuum: %lu\n",
+						 generate_qualified_relation_name(relid), blkno,
+						 free_space);
 
 next_tuple:
 					tuple = get_next_tuple(rel, buf, blkno, &offnum);
@@ -1329,10 +1376,6 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
 			heaptup.t_data = (HeapTupleHeader) PageGetItem(page, lp);
 			heaptup.t_len = ItemIdGetLength(lp);
 			ItemPointerSet(&(heaptup.t_self), blkno, lp_offset);
-#if defined(PGPRO_EE) && PG_VERSION_NUM < 100000
-			heaptup.t_xid_epoch = ((PageHeader) page)->pd_xid_epoch;
-			heaptup.t_multi_epoch = ((PageHeader) page)->pd_multi_epoch;
-#endif
 
 			/* Can we remove this tuple? */
 			switch (HeapTupleSatisfiesVacuum(&heaptup, xid, buf))
@@ -1543,134 +1586,51 @@ get_pageprep_schema(void)
 }
 
 /*
- * Set new status in pg_pageprep_data table
+ * Set new status in pg_pageprep_jobs table
  */
 static void
-update_status(Oid relid, TaskStatus status, int updated)
+update_status(Oid relid, TaskStatus status, int movedTuples)
 {
-	Snapshot	snapshot;
-	HeapTuple	htup,
-				oldtup = NULL,
-				newtup;
-	HeapScanDesc scan;
-	Relation	rel;
-	Oid			jobs_relid = InvalidOid;
-
-	Datum		values[4];
-	bool		nulls[4];
-	bool		replaces[4];
+	Datum values[3] = {ObjectIdGetDatum(relid),
+		CStringGetDatum(status_map[status]), Int32GetDatum(movedTuples)};
+	Oid types[3] = {OIDOID, CSTRINGOID, INT4OID};
 
 	start_xact_command();
-
-	jobs_relid = get_relname_relid("pg_pageprep_jobs", get_pageprep_schema());
-	Assert(OidIsValid(jobs_relid));
-	rel = heap_open(jobs_relid, AccessShareLock);
-	snapshot = RegisterSnapshot(GetLatestSnapshot());
-	scan = heap_beginscan(rel, snapshot, 0, NULL);
-
-	while((htup = heap_getnext(scan, ForwardScanDirection)) != NULL)
-	{
-		Datum		values[4];
-		bool		isnull[4];
-
-		/* Extract Datums from tuple 'htup' */
-		heap_deform_tuple(htup, RelationGetDescr(rel), values, isnull);
-		if (DatumGetObjectId(values[0]) == relid)
-		{
-			oldtup = heap_copytuple(htup);
-			break;
-		}
-	}
-
-	/* Clean resources */
-	heap_endscan(scan);
-	UnregisterSnapshot(snapshot);
-	heap_close(rel, AccessShareLock);
-
-	if (htup == NULL)
-	{
-		elog(NOTICE, "status update failed for \"%s\"",
-				generate_qualified_relation_name(relid));
-		goto end;
-	}
-
-	rel = heap_open(jobs_relid, RowExclusiveLock);
-
-	MemSet(values, 0, sizeof(values));
-	MemSet(nulls, false, sizeof(nulls));
-	MemSet(replaces, false, sizeof(replaces));
-
-	replaces[2] = true;
-	replaces[3] = true;
-	values[2] = CStringGetTextDatum(status_map[status]);
-	if (status == TS_PARTLY || status == TS_DONE)
-		values[3] = Int32GetDatum(updated);
-	else
-		nulls[3] = true;
-
-	newtup = heap_modify_tuple(oldtup, RelationGetDescr(rel),
-								 values, nulls, replaces);
-	simple_heap_update(rel, &oldtup->t_self, newtup);
-	heap_close(rel, RowExclusiveLock);
-
-end:
+	check_SPI_connect();
+	SPI_execute_with_args("update pg_pageprep_jobs set status = $2, "
+						  "updated = $3 where rel = $1",
+						  3 /*nargs*/, types, values, NULL /*nulls*/,
+						  false /*read_only*/, 0 /*tcount*/);
+	SPI_finish();
 	finish_xact_command();
 }
 
 static void
-add_relation_to_jobs(Relation rel)
+add_relation_to_jobs(Oid relid)
 {
-	Datum	values[2];
-	Oid		types[2] = {OIDOID, INT4OID};
+	Relation rel;
+	Datum	value = ObjectIdGetDatum(relid);
+	Oid		type = OIDOID;
+	char	*query;
 
-	if (SPI_connect() == SPI_OK_CONNECT)
-	{
-		char *query;
+	/*
+	 * Lock the relation so that the concurrent writers see our catalog changes.
+	 * We can't do this from SQL because LOCK TABLE does not support
+	 * materialized views. Changing fillfactor requires
+	 * ShareUpdateExclusiveLock, see the option definition in reloptions.c.
+	 */
+	rel = relation_open(relid, ShareUpdateExclusiveLock);
 
-		query = psprintf("SELECT %s.__add_job($1, $2)",
-						 get_namespace_name(get_extension_schema()));
+	check_SPI_connect();
+	query = psprintf("SELECT %s.__add_job($1)",
+					 get_namespace_name(get_extension_schema()));
 
-		values[0] = ObjectIdGetDatum(RelationGetRelid(rel));
-		/* TODO: is default always equal to HEAP_DEFAULT_FILLFACTOR? */
-		values[1] = Int32GetDatum(RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR));
+	SPI_execute_with_args(query, 1, &type, &value, NULL,
+						  false, 0);
+	pfree(query);
+	SPI_finish();
 
-		SPI_execute_with_args(query,
-							  2, types, values, NULL,
-							  false, 0);
-		pfree(query);
-		SPI_finish();
-	}
-}
-
-/*
- * Set new fillfactor
- */
-static void
-update_fillfactor(Relation relation)
-{
-	char *query;
-
-	if (RelationGetFillFactor(relation, HEAP_DEFAULT_FILLFACTOR) > FILLFACTOR)
-	{
-		if (SPI_connect() == SPI_OK_CONNECT)
-		{
-			query = psprintf("select %s.__update_fillfactor(%u, %u)",
-							 get_namespace_name(get_extension_schema()),
-							 relation->rd_id,
-							 FILLFACTOR);
-
-			SPI_exec(query, 0);
-			SPI_finish();
-
-			elog(NOTICE, "fillfactor was updated for \"%s\"",
-					generate_qualified_relation_name(relation->rd_id));
-
-			/* Invalidate relcache */
-			CacheInvalidateRelcacheByRelid(relation->rd_id);
-		}
-		else
-			elog(ERROR, "pg_pageprep: couldn't establish SPI connections");
-	}
+	relation_close(rel, ShareUpdateExclusiveLock);
 }
 
 /*
