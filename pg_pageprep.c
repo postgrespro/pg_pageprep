@@ -446,6 +446,7 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 		Buffer buf;
 		Page page;
 		PageHeader header;
+		size_t free_space;
 
 		CHECK_FOR_INTERRUPTS();
 		buf = ReadBuffer(rel, blkno);
@@ -458,7 +459,7 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 		page = BufferGetPage(buf);
 		header = (PageHeader) page;
 
-		size_t free_space = header->pd_upper - header->pd_lower;
+		free_space = header->pd_upper - header->pd_lower;
 
 		/*
 		 * As a first check find a difference between pd_lower and pg_upper.
@@ -1052,7 +1053,7 @@ static char*
 get_my_extension_ns(void)
 {
 	static char *ns = NULL;
-	Oid res;
+	Oid res = InvalidOid;
 	MemoryContext oldContext;
 
 	if (ns != NULL)
