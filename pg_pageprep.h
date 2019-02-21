@@ -40,7 +40,6 @@ typedef struct
 	volatile WorkerStatus status;
 	pid_t	pid;
 	char	dbname[NAMEDATALEN];
-	Oid		ext_schema;	/* This one is lazy. Use get_extension_schema() */
 	uint64	avg_time_per_page;	/* microseconds */
 } Worker;
 

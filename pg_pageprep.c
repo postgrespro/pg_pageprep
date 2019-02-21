@@ -128,7 +128,7 @@ static void start_bgworker_dynamic(const char *, Oid, bool);
 static int acquire_slot(const char *dbname);
 static int find_database_slot(const char *dbname);
 void worker_main(Datum arg);
-static Oid get_extension_schema(void);
+static char* get_my_extension_ns(void);
 static Oid get_next_relation(void);
 static void scan_pages_internal(Datum relid_datum, bool *interrupted);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno,
@@ -383,7 +383,7 @@ estimate_time(PG_FUNCTION_ARGS)
 	query = psprintf("SELECT count(1), sum(relpages) "
 					 "FROM %s.pg_pageprep_todo todo "
 					 "JOIN pg_class c on todo.oid = c.oid",
-					 get_namespace_name(get_extension_schema()));
+					 get_my_extension_ns());
 
 	if (SPI_exec(query, 0) != SPI_OK_SELECT)
 		elog(ERROR, "pg_pageprep: failed to get total pages count");
@@ -434,24 +434,29 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 	Oid relid = PG_GETARG_OID(0);
 	Relation rel;
 	bool result = true;
+	int blkno;
 
 #ifdef PGPRO_EE
 	elog(ERROR, "This function is supposed to be run before upgrade to the Enterprise edition.");
 #endif
 
 	rel = heap_open(relid, AccessShareLock);
-	for (int blkno = 1; blkno < RelationGetNumberOfBlocks(rel); blkno++)
+	for (blkno = 1; blkno < RelationGetNumberOfBlocks(rel); blkno++)
 	{
+		Buffer buf;
+		Page page;
+		PageHeader header;
+
 		CHECK_FOR_INTERRUPTS();
-		Buffer buf = ReadBuffer(rel, blkno);
+		buf = ReadBuffer(rel, blkno);
 
 		Assert(BufferIsValid(buf));
 		if (!BufferIsValid(buf))
 			continue;
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
-		Page page = BufferGetPage(buf);
-		PageHeader header = (PageHeader) page;
+		page = BufferGetPage(buf);
+		header = (PageHeader) page;
 
 		size_t free_space = header->pd_upper - header->pd_lower;
 
@@ -962,7 +967,6 @@ worker_main(Datum arg)
 		/* Iterate through relations */
 		while (true)
 		{
-			Oid			schema;
 			Oid			relid;
 			bool		interrupted;
 
@@ -983,15 +987,6 @@ worker_main(Datum arg)
 			MyWorker.status = WS_ACTIVE;
 
 			start_xact_command();
-
-			check_SPI_connect();
-			schema = get_extension_schema();
-			if (!OidIsValid(schema))
-				elog(ERROR, "extension is not installed in \"%s\" database",
-						MyWorker.dbname);
-
-			MyWorker.ext_schema = schema;
-			SPI_finish();
 
 			if (OidIsValid(worker_relid))
 				relid = worker_relid;
@@ -1053,32 +1048,38 @@ worker_main(Datum arg)
  *
  * Note: caller is responsible for establishing SPI connection
  */
-static Oid
-get_extension_schema(void)
+static char*
+get_my_extension_ns(void)
 {
-	Oid res = InvalidOid;
+	static char *ns = NULL;
+	Oid res;
+	MemoryContext oldContext;
 
-	if (OidIsValid(MyWorker.ext_schema))
+	if (ns != NULL)
+		return ns;
+
+	if (SPI_exec(EXTENSION_QUERY, 0) != SPI_OK_SELECT)
+		elog(ERROR, "pg_pageprep (%s): failed to execute query (%s)",
+			 get_database_name(MyDatabaseId), EXTENSION_QUERY);
+
+	if (SPI_processed > 0)
 	{
-		return MyWorker.ext_schema;
-	}
-	else
-	{
-		if (SPI_exec(EXTENSION_QUERY, 0) != SPI_OK_SELECT)
-			elog(ERROR, "pg_pageprep (%s): failed to execute query (%s)",
-				 get_database_name(MyDatabaseId), EXTENSION_QUERY);
+		TupleDesc	tupdesc = SPI_tuptable->tupdesc;
+		HeapTuple	tuple = SPI_tuptable->vals[0];
+		bool		isnull;
 
-		if (SPI_processed > 0)
-		{
-			TupleDesc	tupdesc = SPI_tuptable->tupdesc;
-			HeapTuple	tuple = SPI_tuptable->vals[0];
-			bool		isnull;
-
-			res = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
-		}
+		res = DatumGetInt32(SPI_getbinval(tuple, tupdesc, 1, &isnull));
 	}
 
-	return res;
+	if (res == InvalidOid)
+		elog(ERROR, "pg_pageprep is not installed in database \"%s\"",
+			 get_database_name(MyDatabaseId));
+
+	oldContext = MemoryContextSwitchTo(TopMemoryContext);
+	ns = get_namespace_name(res);
+	MemoryContextSwitchTo(oldContext);
+
+	return ns;
 }
 
 static Oid
@@ -1086,12 +1087,11 @@ get_next_relation(void)
 {
 	Datum		relid = InvalidOid;
 	char *query;
-	char *namespace;
 
 	check_SPI_connect();
 
-	namespace = get_namespace_name(get_extension_schema());
-	query = psprintf("SELECT * FROM %s.pg_pageprep_todo", namespace);
+	query = psprintf("SELECT * FROM %s.pg_pageprep_todo",
+					 get_my_extension_ns());
 
 	if (SPI_exec(query, 0) != SPI_OK_SELECT)
 		elog(ERROR, "pg_pageprep::get_next_relation() failed");
@@ -1544,47 +1544,6 @@ update_indexes(Relation rel, HeapTuple tuple)
 	}
 }
 
-static Oid
-get_pageprep_schema(void)
-{
-	Oid				result;
-	Relation		rel;
-	SysScanDesc		scandesc;
-	HeapTuple		tuple;
-	ScanKeyData		entry[1];
-	Oid				ext_oid;
-
-	/* It's impossible to fetch pg_pathman's schema now */
-	if (!IsTransactionState())
-		return InvalidOid;
-
-	ext_oid = get_extension_oid("pg_pageprep", true);
-	if (ext_oid == InvalidOid)
-		return InvalidOid; /* exit if pg_pathman does not exist */
-
-	ScanKeyInit(&entry[0],
-				ObjectIdAttributeNumber,
-				BTEqualStrategyNumber, F_OIDEQ,
-				ObjectIdGetDatum(ext_oid));
-
-	rel = heap_open(ExtensionRelationId, AccessShareLock);
-	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  NULL, 1, entry);
-
-	tuple = systable_getnext(scandesc);
-
-	/* We assume that there can be at most one matching tuple */
-	if (HeapTupleIsValid(tuple))
-		result = ((Form_pg_extension) GETSTRUCT(tuple))->extnamespace;
-	else
-		result = InvalidOid;
-
-	systable_endscan(scandesc);
-
-	heap_close(rel, AccessShareLock);
-	return result;
-}
-
 /*
  * Set new status in pg_pageprep_jobs table
  */
@@ -1594,12 +1553,14 @@ update_status(Oid relid, TaskStatus status, int movedTuples)
 	Datum values[3] = {ObjectIdGetDatum(relid),
 		CStringGetDatum(status_map[status]), Int32GetDatum(movedTuples)};
 	Oid types[3] = {OIDOID, CSTRINGOID, INT4OID};
+	char *query;
 
 	start_xact_command();
 	check_SPI_connect();
-	SPI_execute_with_args("update pg_pageprep_jobs set status = $2, "
-						  "updated = $3 where rel = $1",
-						  3 /*nargs*/, types, values, NULL /*nulls*/,
+	query = psprintf("update %s.pg_pageprep_jobs set status = $2, "
+					 "updated = $3 where rel = $1",
+					 get_my_extension_ns());
+	SPI_execute_with_args(query, 3 /*nargs*/, types, values, NULL /*nulls*/,
 						  false /*read_only*/, 0 /*tcount*/);
 	SPI_finish();
 	finish_xact_command();
@@ -1623,7 +1584,7 @@ add_relation_to_jobs(Oid relid)
 
 	check_SPI_connect();
 	query = psprintf("SELECT %s.__add_job($1)",
-					 get_namespace_name(get_extension_schema()));
+					 get_my_extension_ns());
 
 	SPI_execute_with_args(query, 1, &type, &value, NULL,
 						  false, 0);

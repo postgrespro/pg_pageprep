@@ -86,7 +86,7 @@ begin
 		on true
 	),
 	new_job as (
-		insert into pg_pageprep_jobs
+		insert into @extschema@.pg_pageprep_jobs
 		select rel, fillfactor, 'new' from relinfo
 		on conflict do nothing returning true
 	)
@@ -94,7 +94,7 @@ begin
 
 	-- Don't update fillfactor if we didn't create the job.
 	if did_insert then
-		perform __set_fillfactor(rel, 90);
+		perform @extschema@.__set_fillfactor(rel, 90);
 		raise notice 'fillfactor was updated for "%"', rel;
 	end if;
 end
