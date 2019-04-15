@@ -11,7 +11,8 @@ class DbConnector:
     def exec_query(self, sql):
         try:
             res = self.exec_query_throwable(sql)
-        except Exception:
+        except Exception as ex:
+            print(ex)
             res = ''
         return res
 
