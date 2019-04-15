@@ -17,12 +17,14 @@ class DbConnector:
 
     def exec_query_throwable(self, sql):
 
+        # Pass optional arguments before mandatory ones (this is important for
+        # BSD and Windows).
         p = subprocess.Popen([
             self.psql_path,
-            self.db,
             "-U", self.role,
             "-c", sql,
-            "-F,", "-t", "-A"],
+            "-F,", "-t", "-A",
+            self.db],
             stdout=subprocess.PIPE)
         out, _ = p.communicate()
 
