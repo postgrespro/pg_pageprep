@@ -110,7 +110,7 @@ if __name__ == '__main__':
 
     # databases = [x.strip() for x in args.databases.split(",")]
     con = utils.DbConnector(args.database, args.role)
-    databases_str = con.exec_query("SELECT datname FROM pg_database WHERE datname != 'template0'")
+    databases_str = con.exec_query("SELECT datname FROM pg_database WHERE datallowconn")
     databases = databases_str.split()
 
     if args.command in funcs:
