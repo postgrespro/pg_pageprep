@@ -167,7 +167,14 @@ _PG_init(void)
 	setup_guc_variables();
 
 #if !(PG_VERSION_NUM >= 100000 && defined(PGPRO_EE))
-	if (pg_pageprep_enable_workers)
+	/*
+	 * Running workers during pg_upgrade confclicts with some operations. For
+	 * example pg_upgrade drops databases and it fails if there are some
+	 * connections to a database.
+	 */
+	if (IsBinaryUpgrade)
+		elog(LOG, "pg_pageprep: workers are disabled during pg_upgrade");
+	else if (pg_pageprep_enable_workers)
 		start_starter_process();
 	else
 		elog(LOG, "pg_pageprep: workers are disabled");
@@ -1401,7 +1408,7 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
 /*
  * get_next_tuple
  *		Returns tuple that could be moved to another page
- * 
+ *
  *		Note: Caller must hold shared lock on the page
  */
 static HeapTuple
