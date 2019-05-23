@@ -130,7 +130,9 @@ static int find_database_slot(const char *dbname);
 void worker_main(Datum arg);
 static char* get_my_extension_ns(void);
 static Oid get_next_relation(void);
-static void scan_pages_internal(Datum relid_datum, bool *interrupted);
+static void scan_pages_internal(Datum relid_datum,
+								BufferAccessStrategy bstrategy,
+								bool *interrupted);
 static HeapTuple get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno,
 		OffsetNumber *start_offset);
 static bool can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
@@ -421,11 +423,15 @@ Datum
 scan_pages_pl(PG_FUNCTION_ARGS)
 {
 	Oid			relid = PG_GETARG_OID(0);
+	BufferAccessStrategy bstrategy;
 	bool		interrupted;
 
 	add_relation_to_jobs(relid);
 
-	scan_pages_internal(relid, &interrupted);
+	bstrategy = GetAccessStrategy(BAS_VACUUM);
+	scan_pages_internal(relid, bstrategy, &interrupted);
+	FreeAccessStrategy(bstrategy);
+
 	PG_RETURN_VOID();
 }
 
@@ -920,6 +926,7 @@ worker_main(Datum arg)
 	PGPROC		   *starter;
 	Oid				worker_relid;
 	bool			async;
+	BufferAccessStrategy bstrategy;
 
 	/* Establish signal handlers before unblocking signals */
 	pqsignal(SIGTERM, handle_sigterm);
@@ -952,6 +959,8 @@ worker_main(Datum arg)
 		/* let start other workers */
 		SetLatch(&starter->procLatch);
 	}
+
+	bstrategy = GetAccessStrategy(BAS_VACUUM);
 
 	elog(LOG, "pg_pageprep: worker is started (pid: %u) for \"%s\" database",
 			MyProcPid, MyWorker.dbname);
@@ -1020,7 +1029,8 @@ worker_main(Datum arg)
 			finish_xact_command();
 
 			interrupted = false;
-			scan_pages_internal(ObjectIdGetDatum(relid), &interrupted);
+			scan_pages_internal(ObjectIdGetDatum(relid), bstrategy,
+								&interrupted);
 			if (interrupted)
 				break;
 
@@ -1127,7 +1137,8 @@ get_next_relation(void)
 }
 
 static void
-scan_pages_internal(Datum relid_datum, bool *interrupted)
+scan_pages_internal(Datum relid_datum, BufferAccessStrategy bstrategy,
+					bool *interrupted)
 {
 	Oid			relid = DatumGetObjectId(relid_datum);
 	Relation	rel;
