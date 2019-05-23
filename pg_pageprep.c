@@ -446,12 +446,15 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 {
 	Oid relid = PG_GETARG_OID(0);
 	Relation rel;
+	BufferAccessStrategy bstrategy;
 	bool result = true;
 	int blkno;
 
 #ifdef PGPRO_EE
 	elog(ERROR, "This function is supposed to be run before upgrade to the Enterprise edition.");
 #endif
+
+	bstrategy = GetAccessStrategy(BAS_VACUUM);
 
 	rel = heap_open(relid, AccessShareLock);
 	for (blkno = 1; blkno < RelationGetNumberOfBlocks(rel); blkno++)
@@ -462,7 +465,8 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 		size_t free_space;
 
 		CHECK_FOR_INTERRUPTS();
-		buf = ReadBuffer(rel, blkno);
+		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+								 bstrategy);
 
 		Assert(BufferIsValid(buf));
 		if (!BufferIsValid(buf))
@@ -509,6 +513,8 @@ can_upgrade_table(PG_FUNCTION_ARGS)
 		ReleaseBuffer(buf);
 	}
 	heap_close(rel, AccessShareLock);
+
+	FreeAccessStrategy(bstrategy);
 
 	PG_RETURN_BOOL(result);
 }
@@ -1209,7 +1215,8 @@ retry_block:
 			if (blkno >= RelationGetNumberOfBlocks(rel))
 				break;
 
-			buf = ReadBuffer(rel, blkno);
+			buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
+									 bstrategy);
 
 			/* Skip invalid buffers */
 			if (!BufferIsValid(buf))
