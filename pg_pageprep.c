@@ -1241,7 +1241,8 @@ retry_block:
 				 * Check if there are some dead or redundant tuples which could
 				 * be removed to free enough space for new page format
 				 */
-				can_free_some_space = can_remove_old_tuples(rel, buf, blkno, &free_space);
+				can_free_some_space = can_remove_old_tuples(rel, buf, blkno,
+															&free_space);
 
 				/* If there are, then we're done with this page */
 				if (can_free_some_space)
@@ -1256,7 +1257,6 @@ retry_block:
 				else
 				{
 					HeapTuple		tuple;
-					HeapTuple		new_tuple;
 					OffsetNumber	offnum = FirstOffsetNumber;
 
 					elog(LOG, "%s blkno=%u: not enough space after vacuum: %lu\n",
@@ -1279,12 +1279,12 @@ next_tuple:
 						goto next_block;
 					}
 
-					new_tuple = heap_copytuple(tuple);
-
-					if (update_heap_tuple(rel, &tuple->t_self, new_tuple))
+					if (update_heap_tuple(rel, &tuple->t_self, tuple))
 					{
 						free_space += tuple->t_len;
 						tuples_moved++;
+
+						heap_freetuple(tuple);
 
 						/*
 						 * One single tuple could be sufficient since tuple
@@ -1302,6 +1302,7 @@ next_tuple:
 					elog(LOG, "pg_pageprep: %s blkno=%u: failed to update tuple, trying next",
 						 generate_qualified_relation_name(relid),
 						 blkno);
+					heap_freetuple(tuple);
 					LockBuffer(buf, BUFFER_LOCK_SHARE);
 					goto next_tuple;
 				}
@@ -1375,7 +1376,7 @@ next_block:
  */
 static bool
 can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
-		size_t *free_space)
+					  size_t *free_space)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
@@ -1430,7 +1431,8 @@ can_remove_old_tuples(Relation rel, Buffer buf, BlockNumber blkno,
  *		Note: Caller must hold shared lock on the page
  */
 static HeapTuple
-get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno, OffsetNumber *start_offset)
+get_next_tuple(Relation rel, Buffer buf, BlockNumber blkno,
+			   OffsetNumber *start_offset)
 {
 	int				lp_count;
 	OffsetNumber	lp_offset;
