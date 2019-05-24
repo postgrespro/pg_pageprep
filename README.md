@@ -13,6 +13,13 @@ to original PostgreSQL in order to support 64bit transaction IDs. The idea
 behind this extension is to prepare enough space in pages for new format
 while database is working on vanilla postgres.
 
+# Compatibility
+
+`pg_pageprep` provides possibility to migrate data to PostgresPro Enterpise 11
+from the following versions:
+* PostgreSQL 10 and 11;
+* PostgresPro Standard 10 and 11.
+
 # Installation
 
 ```
@@ -90,7 +97,7 @@ To view current workers status use function `get_workers_list()`:
 ```
 SELECT * FROM get_workers_list();
 
- database | status 
+ database | status
 ----------+--------
  postgres | active
 (1 row)
