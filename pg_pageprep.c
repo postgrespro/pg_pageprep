@@ -74,6 +74,9 @@ int MyWorkerIndex = 0;
 static int pg_pageprep_per_page_delay = 0;
 static int pg_pageprep_per_relation_delay = 0;
 static int pg_pageprep_per_attempt_delay = 0;
+
+static int page_delay_balance = 0;
+
 static char *pg_pageprep_database = NULL;
 static bool pg_pageprep_enable_workers = true;
 static bool pg_pageprep_enable_runtime_fillfactor = true;
@@ -204,7 +207,7 @@ setup_guc_variables(void)
 							"The delay length between consequent pages scans in milliseconds",
 							NULL,
 							&pg_pageprep_per_page_delay,
-							100,
+							10,
 							0,
 							1000,
 							PGC_SUSET,
@@ -217,7 +220,7 @@ setup_guc_variables(void)
 							"The delay length between relation scans in milliseconds",
 							NULL,
 							&pg_pageprep_per_relation_delay,
-							1000,
+							0,
 							0,
 							60000,
 							PGC_SUSET,
@@ -341,6 +344,40 @@ sleep_interruptible(long milliseconds)
 	}
 
 	pg_usleep((milliseconds % 1000) * 1000L);
+}
+
+/*
+ * Check for interrupts and cost-based delay.
+ *
+ * This should be called in each major loop of page processing.
+ */
+static void
+page_delay_point(void)
+{
+	CHECK_FOR_INTERRUPTS();
+
+	/*
+	 * Nap if appropriate.
+	 *
+	 * We use VACUUM variables to calculate costs, but we use own balance
+	 * variable page_delay_balance.
+	 */
+	if (pg_pageprep_per_page_delay > 0 && !InterruptPending &&
+		page_delay_balance > VacuumCostBalance)
+	{
+		int			msec;
+
+		msec = pg_pageprep_per_page_delay * page_delay_balance / VacuumCostLimit;
+		if (msec > pg_pageprep_per_page_delay * 4)
+			msec = pg_pageprep_per_page_delay * 4;
+
+		pg_usleep(msec * 1000L);
+
+		page_delay_balance = 0;
+
+		/* Might have gotten an interrupt while sleeping */
+		CHECK_FOR_INTERRUPTS();
+	}
 }
 
 static void
@@ -1170,6 +1207,7 @@ scan_pages_internal(Datum relid_datum, BufferAccessStrategy bstrategy,
 	oldcontext = MemoryContextSwitchTo(tmpctx);
 
 	*interrupted = false;
+	page_delay_balance = 0;
 	PG_TRY();
 	{
 		/*
@@ -1181,6 +1219,9 @@ scan_pages_internal(Datum relid_datum, BufferAccessStrategy bstrategy,
 			Page		page;
 			PageHeader	header;
 			size_t		free_space;
+			BufferUsage bufusage_start;
+
+			bufusage_start = pgBufferUsage;
 
 			if (reopen_relation)
 			{
@@ -1251,9 +1292,6 @@ retry_block:
 						 generate_qualified_relation_name(relid),
 						 blkno);
 				}
-				/*
-				 *
-				 */
 				else
 				{
 					HeapTuple		tuple;
@@ -1324,7 +1362,24 @@ next_block:
 			if (reopen_relation)
 				heap_close(rel, RowExclusiveLock);
 
-			sleep_interruptible(pg_pageprep_per_page_delay);
+			/* Calculations for delay point */
+
+			/* Read cost from buffer pool */
+			page_delay_balance +=
+				(((pgBufferUsage.local_blks_hit - bufusage_start.local_blks_hit) +
+				  (pgBufferUsage.shared_blks_hit - bufusage_start.shared_blks_hit)) *
+				 VacuumCostPageHit);
+			/* Read cost from disk drive */
+			page_delay_balance +=
+				(((pgBufferUsage.local_blks_read - bufusage_start.local_blks_read) +
+				  (pgBufferUsage.shared_blks_read - bufusage_start.shared_blks_read)) *
+				 VacuumCostPageMiss);
+			/* Write cost */
+			page_delay_balance +=
+				((pgBufferUsage.shared_blks_dirtied - bufusage_start.shared_blks_dirtied) *
+				 VacuumCostPageDirty);
+
+			page_delay_point();
 		}
 
 		heap_close(rel, RowExclusiveLock);
