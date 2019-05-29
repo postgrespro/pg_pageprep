@@ -363,7 +363,7 @@ page_delay_point(void)
 	 * variable page_delay_balance.
 	 */
 	if (pg_pageprep_per_page_delay > 0 && !InterruptPending &&
-		page_delay_balance > VacuumCostBalance)
+		page_delay_balance > VacuumCostLimit)
 	{
 		int			msec;
 
