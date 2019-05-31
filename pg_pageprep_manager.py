@@ -1,22 +1,22 @@
 import argparse
-import utils
+from pg_connector import DbConnector
 
 
 def install(databases):
-    con = utils.DbConnector(databases[0], args.role)
+    con = DbConnector(databases[0], args.role, args.pgpath)
     con.exec_query(
         "alter system set pg_pageprep.database='{}'".format(args.database))
     con.exec_query(
         "alter system set pg_pageprep.role='{}'".format(args.role))
 
     for db in databases:
-        con = utils.DbConnector(db, args.role)
+        con = DbConnector(db, args.role, args.pgpath)
         con.exec_query("create extension pg_pageprep")
 
 
 def start(databases):
     for db in databases:
-        local_con = utils.DbConnector(db, args.role)
+        local_con = DbConnector(db, args.role, args.pgpath)
 
         if extension_exists(local_con):
             local_con.exec_query("select start_bgworker();")
@@ -24,14 +24,14 @@ def start(databases):
 
 def stop(databases):
     for db in databases:
-        local_con = utils.DbConnector(db, args.role)
+        local_con = DbConnector(db, args.role, args.pgpath)
 
         if extension_exists(local_con):
             local_con.exec_query("select stop_bgworker();")
 
 
 def status(databases):
-    con = utils.DbConnector(databases[0], args.role)
+    con = DbConnector(databases[0], args.role, args.pgpath)
     show_workers_list(con)
     all_done = show_todo_lists(databases)
 
@@ -57,7 +57,7 @@ def show_todo_lists(databases):
     for db in databases:
         print("\n'{}' database todo list:".format(db))
 
-        con = utils.DbConnector(db, args.role)
+        con = DbConnector(db, args.role, args.pgpath)
         if not extension_exists(con):
             continue
 
@@ -86,7 +86,7 @@ def restore(databases):
     stop(databases)
 
     for db in databases:
-        con = utils.DbConnector(db, args.role)
+        con = DbConnector(db, args.role, args.pgpath)
         if extension_exists(con):
             con.exec_query("select restore_fillfactors()")
 
@@ -104,16 +104,18 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--database", help="Database name (required)", required=True)
     parser.add_argument("-U", "--username", dest="role", help="Role", default="postgres", required=True)
+    parser.add_argument("-b", "--pgpath", dest="pgpath", help="Path to PostgreSQL binaries")
     parser.add_argument("--emit_error", action="store_true", default=None, help=argparse.SUPPRESS)
     parser.add_argument("command", nargs="?", help="command (start, stop, status)")
     args = parser.parse_args()
 
     # databases = [x.strip() for x in args.databases.split(",")]
-    con = utils.DbConnector(args.database, args.role)
+    con = DbConnector(args.database, args.role, args.pgpath)
     databases_str = con.exec_query("SELECT datname FROM pg_database WHERE datname != 'template0'")
     databases = databases_str.split()
 
-    if args.command in funcs:
-        funcs[args.command](databases)
-    else:
-        print("unknown command {}".format(args.command))
+    if databases:
+        if args.command in funcs:
+            funcs[args.command](databases)
+        else:
+            print("unknown command {}".format(args.command))
