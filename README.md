@@ -55,7 +55,7 @@ You can add the following parameters to your postgres config:
 ## Python script
 
 ```
-python manager.py -d <database> -U <username> <command>
+python pg_pageprep_manager.py -d <database> -U <username> <command>
 ```
 
 where `<database>` is a database used to get the list of all databases in cluster, `<username>` is a user name on whose behalf the script will work and `command` is one of the following:
@@ -69,11 +69,11 @@ where `<database>` is a database used to get the list of all databases in cluste
 Example:
 
 ```
-python manager.py -d postgres -U my_username status
+python pg_pageprep_manager.py -d postgres -U my_username status
 ```
 
-> **Note:** If pg_config isn't on your path you'll need to set PG_CONFIG environment variable:
-> `PG_CONFIG=/path/to/pg_config python manager.py -d postgres -U my_username status`
+> **Note:** If psql isn't on your path you'll need to pass `pgpath` (`b`) option:
+> `python pg_pageprep_manager.py -d postgres -U my_username -b /path/to/bin/dir status`
 
 ## plpgsql
 
